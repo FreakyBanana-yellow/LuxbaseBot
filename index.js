@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 3000;
 
 // ENV
 const BOT_TOKEN = process.env.BOT_TOKEN;                      // z.B. 8457:AAA...
-const BASE_URL  = process.env.BASE_URL;                       // https://luxentry.onrender.com (oder Custom Domain)
+const BASE_URL  = process.env.BASE_URL;                       // https://luxbasebot.onrender.com
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
@@ -33,6 +33,15 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: {
 // Webhook-URLs
 const telegramPath = `/bot${BOT_TOKEN}`;
 const telegramWebhook = `${BASE_URL}${telegramPath}`;
+
+// --- CORS (für Aufrufe vom Astro-Frontend / Netlify) ---
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*"); // bei Bedarf auf deine Domain einschränken
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
 
 // Middlewares (Stripe braucht RAW, Rest JSON)
 app.use((req, res, next) => {
@@ -60,13 +69,16 @@ const addDaysISO = (d) => new Date(Date.now()+d*864e5).toISOString().slice(0,10)
 
 async function getCreatorCfg(param) {
   if (!param) return null;
+
+  // 1st: by creator_id
   let { data } = await supabase.from("creator_config")
-    .select("creator_id, preis, vip_days, gruppe_link, group_chat_id, stripe_price_id, welcome_text, regeln_text")
+    .select("creator_id, preis, vip_days, gruppe_link, group_chat_id, stripe_price_id, welcome_text, regeln_text, stripe_account_id, application_fee_pct")
     .eq("creator_id", param).maybeSingle();
   if (data) return data;
 
+  // 2nd: fallback by (legacy) telegramlink
   const q2 = await supabase.from("creator_config")
-    .select("creator_id, preis, vip_days, gruppe_link, group_chat_id, stripe_price_id, welcome_text, regeln_text")
+    .select("creator_id, preis, vip_days, gruppe_link, group_chat_id, stripe_price_id, welcome_text, regeln_text, stripe_account_id, application_fee_pct")
     .eq("telegramlink", param).maybeSingle();
   return q2.data || null;
 }
@@ -158,23 +170,51 @@ bot.on("callback_query", async (q) => {
     return;
   }
 
+  if (!stripe) {
+    await bot.answerCallbackQuery(q.id, { text: "Stripe nicht konfiguriert." });
+    return;
+  }
+
+  if (!creator.stripe_account_id) {
+    await bot.answerCallbackQuery(q.id, { text: "Stripe Account fehlt. Bitte zuerst „Stripe verbinden“ in den Einstellungen." });
+    return;
+  }
+
   try {
+    // Line Item
     let lineItem;
     if (creator.stripe_price_id) {
       lineItem = { price: creator.stripe_price_id, quantity: 1 };
     } else {
       const amount = Math.max(0, Math.round(Number(creator.preis || 0) * 100));
-      lineItem = { price_data: { currency: "eur", product_data: { name: `VIP ${row.creator_id.slice(0,8)}` }, unit_amount: amount }, quantity: 1 };
+      lineItem = {
+        price_data: {
+          currency: "eur",
+          product_data: { name: `VIP ${row.creator_id.slice(0,8)}` },
+          unit_amount: amount
+        },
+        quantity: 1
+      };
     }
 
-    if (!stripe) throw new Error("Stripe nicht konfiguriert.");
+    // Plattform-Gebühr (optional, Prozent aus DB)
+    const unitAmount = lineItem.price ? null : lineItem.price_data.unit_amount;
+    const baseAmount = unitAmount ?? 0;
+    const fee = creator.application_fee_pct
+      ? Math.round(baseAmount * (Number(creator.application_fee_pct) / 100))
+      : 0;
 
+    // Destination Charge → Geld direkt an Model-Stripe-Account
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       line_items: [lineItem],
       success_url: `${BASE_URL}/stripe/success`,
       cancel_url: `${BASE_URL}/stripe/cancel`,
-      metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId) }
+      metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId) },
+      payment_intent_data: {
+        transfer_data: { destination: creator.stripe_account_id },
+        ...(fee > 0 ? { application_fee_amount: fee } : {})
+      }
     });
 
     await bot.answerCallbackQuery(q.id);
@@ -205,6 +245,81 @@ bot.on("message", async (msg) => {
   if (!msg?.from) return;
   await supabase.from("vip_users").update({ letzter_kontakt: nowTS() }).eq("telegram_id", String(msg.from.id));
 });
+
+// --- Stripe-Connect: JSON-Link Endpoint ---
+app.get("/api/stripe/connect-link", async (req, res) => {
+  try {
+    const creator_id = req.query.creator_id;
+    if (!creator_id) return res.status(400).json({ error: "creator_id fehlt" });
+    if (!stripe) return res.status(500).json({ error: "Stripe nicht konfiguriert" });
+
+    const { data: cfg } = await supabase
+      .from("creator_config")
+      .select("stripe_account_id")
+      .eq("creator_id", creator_id)
+      .maybeSingle();
+
+    let accountId = cfg?.stripe_account_id;
+    if (!accountId) {
+      const account = await stripe.accounts.create({ type: "express", country: "DE" });
+      accountId = account.id;
+      await supabase.from("creator_config").update({ stripe_account_id: accountId }).eq("creator_id", creator_id);
+    }
+
+    const link = await stripe.accountLinks.create({
+      account: accountId,
+      refresh_url: `${BASE_URL}/stripe/connect/refresh?creator_id=${creator_id}`,
+      return_url:  `${BASE_URL}/stripe/connect/return?creator_id=${creator_id}`,
+      type: "account_onboarding",
+    });
+
+    return res.json({ url: link.url });
+  } catch (e) {
+    console.error("connect-link failed:", e.message);
+    return res.status(500).json({ error: "connect-link failed" });
+  }
+});
+
+// --- Stripe-Connect: Redirect Endpoint (ohne JS benutzbar) ---
+app.get("/api/stripe/connect-redirect", async (req, res) => {
+  try {
+    const creator_id = req.query.creator_id;
+    if (!creator_id) return res.status(400).send("creator_id fehlt");
+    if (!stripe) return res.status(500).send("Stripe nicht konfiguriert");
+
+    const { data: cfg } = await supabase
+      .from("creator_config")
+      .select("stripe_account_id")
+      .eq("creator_id", creator_id)
+      .maybeSingle();
+
+    let accountId = cfg?.stripe_account_id;
+    if (!accountId) {
+      const account = await stripe.accounts.create({ type: "express", country: "DE" });
+      accountId = account.id;
+      await supabase.from("creator_config").update({ stripe_account_id: accountId }).eq("creator_id", creator_id);
+    }
+
+    const link = await stripe.accountLinks.create({
+      account: accountId,
+      refresh_url: `${BASE_URL}/stripe/connect/refresh?creator_id=${creator_id}`,
+      return_url:  `${BASE_URL}/stripe/connect/return?creator_id=${creator_id}`,
+      type: "account_onboarding",
+    });
+
+    return res.redirect(303, link.url);
+  } catch (e) {
+    console.error("connect-redirect failed:", e.message);
+    return res.status(500).send("connect-redirect failed");
+  }
+});
+
+app.get("/stripe/connect/return", (req, res) =>
+  res.send("✅ Stripe verbunden. Du kannst dieses Fenster schließen.")
+);
+app.get("/stripe/connect/refresh", (req, res) =>
+  res.send("🔁 Bitte Onboarding erneut starten.")
+);
 
 // Stripe Webhook
 app.post("/stripe/webhook", async (req, res) => {
@@ -256,7 +371,7 @@ cron.schedule("0 8 * * *", async () => {
     .select("telegram_id, chat_id, vip_bis").gte("vip_bis", today).lte("vip_bis", warnDate).eq("status", "aktiv");
   for (const u of warnUsers || []) {
     await bot.sendMessage(Number(u.chat_id || u.telegram_id),
-      `⏰ Dein VIP läuft am ${u.vip_bis} ab. Verlängere rechtzeitig mit /pay.`);
+      `⏰ Dein VIP läuft am ${u.vip_bis} ab. Verlängere rechtzeitig mit /start → „Jetzt bezahlen“.`);
   }
 
   // abgelaufen → kicken
@@ -268,14 +383,18 @@ cron.schedule("0 8 * * *", async () => {
     for (const u of expired) {
       const group = map.get(u.creator_id);
       if (!group) continue;
-      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`, {
-        method:"POST", headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id) })
-      });
-      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`, {
-        method:"POST", headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id), only_if_banned: true })
-      });
+      try {
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`, {
+          method:"POST", headers:{ "Content-Type":"application/json" },
+          body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id) })
+        });
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`, {
+          method:"POST", headers:{ "Content-Type":"application/json" },
+          body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id), only_if_banned: true })
+        });
+      } catch (e) {
+        console.error("Kick error:", e.message);
+      }
       await supabase.from("vip_users").update({ status: "abgelaufen" })
         .eq("creator_id", u.creator_id).eq("telegram_id", u.telegram_id);
       await bot.sendMessage(Number(u.chat_id || u.telegram_id),
