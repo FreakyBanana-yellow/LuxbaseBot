@@ -93,7 +93,7 @@ app.use((req, res, next) => {
 // ──────────────────────────────────────────────────────────────────────────────
 const telegramPath = `/bot${BOT_TOKEN}`;
 const telegramWebhook = `${BASE_URL}${telegramPath}`;
-const bot = new TelegramBot(BOT_TOKEN);
+const bot = new TelegramBot(BOT_TOKEN, { webHook: true });
 
 async function bootstrapTelegram() {
   await bot.setWebHook(telegramWebhook);
