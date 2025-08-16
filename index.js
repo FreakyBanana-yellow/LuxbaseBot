@@ -100,10 +100,11 @@ async function bootstrapTelegram() {
   console.log("✅ Telegram Webhook:", telegramWebhook);
 
   // Eingehende Updates an Bot weiterreichen
- app.post(telegramPath, (req, res) => {
-  console.log("📩 Incoming Telegram Update:", JSON.stringify(req.body, null, 2));
-  bot.processUpdate(req.body);
+ app.post(`/bot${BOT_TOKEN}`, (req, res) => {
+  console.log("📩 Update von Telegram:", JSON.stringify(req.body, null, 2));
   res.sendStatus(200);
+});
+
 });
 
   // /start (DM & Gruppe)
