@@ -100,10 +100,11 @@ async function bootstrapTelegram() {
   console.log("✅ Telegram Webhook:", telegramWebhook);
 
   // Eingehende Updates an Bot weiterreichen
-  app.post(telegramPath, (req, res) => {
-    bot.processUpdate(req.body);
-    res.sendStatus(200);
-  });
+ app.post(telegramPath, (req, res) => {
+  console.log("📩 Incoming Telegram Update:", JSON.stringify(req.body, null, 2));
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
 
   // /start (DM & Gruppe)
   bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
@@ -437,5 +438,7 @@ app.get("/stripe/cancel",  (_, res) => res.send("❌ Zahlung abgebrochen."));
 // ──────────────────────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   console.log(`🚀 on :${PORT}  webhook: ${telegramWebhook}`);
+  const info = await bot.setWebHook(telegramWebhook);
+  console.log("Telegram setWebhook response:", info);
   await bootstrapTelegram();
 });
