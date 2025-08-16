@@ -437,8 +437,12 @@ app.get("/stripe/cancel",  (_, res) => res.send("❌ Zahlung abgebrochen."));
 // Start
 // ──────────────────────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
-  console.log(`🚀 on :${PORT}  webhook: ${telegramWebhook}`);
-  const info = await bot.setWebHook(telegramWebhook);
-  console.log("Telegram setWebhook response:", info);
+  console.log(`🚀 on :${PORT} webhook: ${telegramWebhook}`);
+  try {
+    const info = await bot.setWebHook(telegramWebhook);
+    console.log("Telegram setWebHook response:", info);
+  } catch (err) {
+    console.error("❌ setWebHook error:", err.message);
+  }
   await bootstrapTelegram();
 });
