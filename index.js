@@ -419,32 +419,81 @@ app.post("/stripe/webhook", async (req, res) => {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  if (event.type === "checkout.session.completed") {
-    const s = event.data.object;
-    const creator_id = s.metadata?.creator_id;
-    const telegram_id = s.metadata?.telegram_id;
-    const chat_id = s.metadata?.chat_id;
+ if (event.type === "checkout.session.completed") {
+  const s = event.data.object;
+  const creator_id = s.metadata?.creator_id || s.subscription_data?.metadata?.creator_id;
+  const telegram_id = s.metadata?.telegram_id || s.subscription_data?.metadata?.telegram_id;
+  const chat_id = s.metadata?.chat_id || s.subscription_data?.metadata?.chat_id;
+  const vipDaysMeta = s.subscription_data?.metadata?.vip_days;
 
-    try {
-      const cfg = await getCreatorCfgById(creator_id);
-      const days = Number(cfg?.vip_days ?? cfg?.vip_dauer ?? 30);
-      const vip_bis = addDaysISO(days);
+  try {
+    const cfg = await getCreatorCfgById(creator_id);
+    const days = Number(vipDaysMeta ?? cfg?.vip_days ?? cfg?.vip_dauer ?? 30);
+    const vip_bis = addDaysISO(days);
 
-      const { data: vipRow } = await supabase.from("vip_users").upsert(
-        { creator_id, telegram_id, chat_id, status: "aktiv", vip_bis },
-        { onConflict: "creator_id,telegram_id" }
-      ).select("telegram_id, chat_id").maybeSingle();
+    const { data: vipRow } = await supabase.from("vip_users").upsert(
+      { creator_id, telegram_id, chat_id, status: "aktiv", vip_bis },
+      { onConflict: "creator_id,telegram_id" }
+    ).select("telegram_id, chat_id").maybeSingle();
 
-      if (cfg?.welcome_text) await bot.sendMessage(Number(chat_id), cfg.welcome_text);
-      if (cfg?.regeln_text)  await bot.sendMessage(Number(chat_id), cfg.regeln_text);
+    if (cfg?.welcome_text) await bot.sendMessage(Number(chat_id), cfg.welcome_text);
+    if (cfg?.regeln_text)  await bot.sendMessage(Number(chat_id), cfg.regeln_text);
 
-      const ok = await sendDynamicInvite(cfg?.group_chat_id, vipRow?.chat_id || chat_id);
-      if (!ok && cfg?.gruppe_link) {
-        await bot.sendMessage(Number(chat_id), `🎟️ Dein VIP‑Zugang: ${cfg.gruppe_link}`);
-      }
-    } catch (e) { console.error("Fulfill error:", e.message); }
+    const ok = await sendDynamicInvite(cfg?.group_chat_id, vipRow?.chat_id || chat_id);
+    if (!ok && cfg?.gruppe_link) {
+      await bot.sendMessage(Number(chat_id), `🎟️ Dein VIP‑Zugang: ${cfg.gruppe_link}`);
+    }
+  } catch (e) { console.error("Fulfill error:", e.message); }
+}
+
+// ➕ NEU: jede bezahlte Rechnung verlängert erneut um vipDays
+if (event.type === "invoice.paid") {
+  const inv = event.data.object;
+
+  try {
+    // Wir holen die Subscription-Metadaten (creator_id, telegram_id, chat_id, vip_days)
+    const subId = inv.subscription;
+    if (!subId) return;
+
+    const subscription = await stripe.subscriptions.retrieve(subId);
+    const md = subscription?.metadata || {};
+    const creator_id = md.creator_id;
+    const telegram_id = md.telegram_id;
+    const chat_id = md.chat_id;
+    const vipDays = Number(md.vip_days || 30);
+
+    if (!creator_id || !telegram_id) return;
+
+    // vip_bis ab heutigem Tag (oder alternativ ab invoice.period_end) um vipDays verlängern
+    const vip_bis = addDaysISO(vipDays);
+
+    await supabase.from("vip_users").upsert(
+      { creator_id, telegram_id, chat_id, status: "aktiv", vip_bis },
+      { onConflict: "creator_id,telegram_id" }
+    );
+
+    // Optional Info an User:
+    // await bot.sendMessage(Number(chat_id || telegram_id), `✅ Dein VIP wurde verlängert bis ${vip_bis}.`);
+  } catch (e) {
+    console.error("invoice.paid handler error:", e.message);
   }
+}
 
+// Optional: Kündigungen erkennen
+if (event.type === "customer.subscription.deleted") {
+  const sub = event.data.object;
+  try {
+    const md = sub?.metadata || {};
+    const creator_id = md.creator_id;
+    const telegram_id = md.telegram_id;
+    if (!creator_id || !telegram_id) return;
+
+    await supabase.from("vip_users").update({ status: "gekündigt" })
+      .eq("creator_id", creator_id).eq("telegram_id", telegram_id);
+  } catch (e) {
+    console.error("subscription.deleted handler error:", e.message);
+  }
+}
   res.json({ received: true });
 });
 
