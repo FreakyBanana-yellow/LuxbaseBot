@@ -94,7 +94,81 @@ const bot = new TelegramBot(BOT_TOKEN);
 async function bootstrapTelegram() {
   await bot.setWebHook(telegramWebhook);
   console.log("✅ Telegram Webhook:", telegramWebhook);
+// Wenn der Bot einer Gruppe hinzugefügt wird → Admins prüfen → Gruppe automatisch verknüpfen
+bot.on("my_chat_member", async (upd) => {
+  const chat = upd.chat;
+  const me = upd.new_chat_member;
+  if (!chat || !me) return;
 
+  const isGroup = chat.type === "group" || chat.type === "supergroup";
+  const activeNow = me.status === "administrator" || me.status === "member";
+  if (!isGroup || !activeNow) return;
+
+  try {
+    // 1) Admins der Gruppe holen
+    const adminsResp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chat.id })
+    }).then(r => r.json());
+
+    const adminIds = (adminsResp?.result || [])
+      .map(a => String(a?.user?.id))
+      .filter(Boolean);
+
+    if (!adminIds.length) {
+      await bot.sendMessage(chat.id,
+        "👋 Ich bin jetzt hier. Konnte keine Admins erkennen. Bitte stelle sicher, dass ich Admin bin.");
+      return;
+    }
+
+    // 2) Creator suchen, dessen admin-telegram-id unter den Admins ist
+    //    ↳ wir nutzen bei dir das Feld `creator_config.telegram_id`
+    const { data: matches, error } = await supabase
+      .from("creator_config")
+      .select("creator_id, telegram_id")
+      .in("telegram_id", adminIds);
+
+    if (error) {
+      console.error("match admin error:", error.message);
+      await bot.sendMessage(chat.id, "⚠️ Konnte die Gruppe nicht automatisch verknüpfen (DB‑Fehler).");
+      return;
+    }
+
+    if (!matches || matches.length === 0) {
+      // Kein registrierter Admin gefunden → Hinweis, wie koppeln
+      await bot.sendMessage(
+        chat.id,
+        "👋 Ich bin jetzt hier. Um automatisch zu verknüpfen, öffne in meinem DM den Link „Telegram verbinden“ aus den VIP‑Einstellungen (Luxbase) " +
+        "und füge mich danach hier erneut als Admin hinzu."
+      );
+      return;
+    }
+
+    if (matches.length > 1) {
+      // Mehrere Creator matchen (mehrere Admins sind Creator) → keine Verknüpfung, Hinweis
+      await bot.sendMessage(
+        chat.id,
+        "⚠️ Mehrere Creator‑Admins erkannt. Bitte lass nur den gewünschten Creator‑Admin aktiv oder verknüpfe zunächst nur einen Creator."
+      );
+      return;
+    }
+
+    // 3) Eindeutigen Creator gefunden → Gruppe binden
+    const creator_id = matches[0].creator_id;
+    await supabase.from("creator_config")
+      .update({ group_chat_id: String(chat.id) })
+      .eq("creator_id", creator_id);
+
+    await bot.sendMessage(
+      chat.id,
+      "✅ Gruppe wurde automatisch mit deinem VIP‑Bot verknüpft.\n" +
+      "Bitte stelle sicher, dass ich Admin‑Rechte habe (Einladen & Kicken)."
+    );
+  } catch (e) {
+    console.error("my_chat_member auto-bind error:", e?.message || e);
+  }
+});
   app.post(telegramPath, (req, res) => {
     bot.processUpdate(req.body);
     res.sendStatus(200);
@@ -116,7 +190,26 @@ async function bootstrapTelegram() {
       await bot.sendMessage(msg.chat.id, "✅ Gruppe verbunden! Bitte Admin‑Rechte geben.");
       return;
     }
+// Sonderfall: DM-Verknüpfung "link_creator_<id>" (Creator paart sein Telegram)
+const linkMatch = /^link_creator_(.+)$/i.exec((match?.[1] || "").trim());
+if (linkMatch && (msg.chat.type === "private")) {
+  const cId = linkMatch[1];
 
+  // Telegram-ID & Username als Besitzer dieses Creators speichern
+  await supabase.from("creator_config")
+    .update({
+      telegram_id: String(msg.from.id),              // nutzt DEIN vorhandenes Feld
+      admin_telegram_username: msg.from.username || null
+    })
+    .eq("creator_id", cId);
+
+  await bot.sendMessage(
+    msg.chat.id,
+    "✅ Dein Telegram wurde mit deinem Luxbase‑Account verknüpft.\n" +
+    "Als Nächstes: Füge mich als Admin in deine VIP‑Gruppe hinzu – ich verknüpfe sie automatisch."
+  );
+  return;
+}
     // DM
     if (!creator_id) {
       await bot.sendMessage(msg.chat.id, "❌ Ungültiger Start‑Link. Bitte den Link aus deinen VIP‑Einstellungen verwenden.");
