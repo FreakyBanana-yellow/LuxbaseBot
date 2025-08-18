@@ -238,81 +238,115 @@ async function bootstrapTelegram() {
     );
   });
 
- // Inline‑Button „Jetzt bezahlen“ → Stripe Checkout (Subscription + Destination Charge)
-bot.on("callback_query", async (q) => {
-  if (q.data !== "pay_now") return;
-  const chatId = q.message.chat.id;
-  const userId = String(q.from.id);
+  // Inline‑Button „Jetzt bezahlen“ → Stripe Checkout (Subscription mit Capability‑Fallback)
+  bot.on("callback_query", async (q) => {
+    if (q.data !== "pay_now") return;
+    const chatId = q.message.chat.id;
+    const userId = String(q.from.id);
 
-  const { data: row } = await supabase.from("vip_users")
-    .select("creator_id").eq("telegram_id", userId)
-    .order("letzter_kontakt", { ascending: false }).limit(1).maybeSingle();
+    const { data: row } = await supabase.from("vip_users")
+      .select("creator_id").eq("telegram_id", userId)
+      .order("letzter_kontakt", { ascending: false }).limit(1).maybeSingle();
 
-  if (!row?.creator_id) { await bot.answerCallbackQuery(q.id, { text: "Bitte zuerst /start nutzen." }); return; }
+    if (!row?.creator_id) { await bot.answerCallbackQuery(q.id, { text: "Bitte zuerst /start nutzen." }); return; }
 
-  const creator = await getCreatorCfgById(row.creator_id);
-  if (!creator) { await bot.answerCallbackQuery(q.id, { text: "Konfiguration fehlt." }); return; }
-  if (!stripe) { await bot.answerCallbackQuery(q.id, { text: "Stripe nicht konfiguriert." }); return; }
-  if (!creator.stripe_account_id) {
-    await bot.answerCallbackQuery(q.id, { text: "Stripe nicht verbunden. Bitte in den VIP‑Einstellungen verbinden." });
-    return;
-  }
+    const creator = await getCreatorCfgById(row.creator_id);
+    if (!creator) { await bot.answerCallbackQuery(q.id, { text: "Konfiguration fehlt." }); return; }
+    if (!stripe) { await bot.answerCallbackQuery(q.id, { text: "Stripe nicht konfiguriert." }); return; }
+    const acct = creator.stripe_account_id;
+    if (!acct) {
+      await bot.answerCallbackQuery(q.id, { text: "Stripe nicht verbunden. Bitte in den VIP‑Einstellungen verbinden." });
+      return;
+    }
 
-  try {
-    const amountCents = Math.max(0, Math.round(Number(creator.preis || 0) * 100)); // z.B. 49.00 -> 4900
-    const vipDays = Number(creator.vip_days ?? creator.vip_dauer ?? 30); // 30 als Fallback
+    try {
+      // 1) Capabilities prüfen
+      const account = await stripe.accounts.retrieve(acct);
+      const caps = account.capabilities || {};
+      const transfersActive = caps.transfers === "active";
+      const cardActive      = caps.card_payments === "active";
 
-    // Prozentuale Plattform-Fee (falls vorhanden)
-    const feePct = creator.application_fee_pct != null ? Number(creator.application_fee_pct) : null;
+      const amountCents = Math.max(0, Math.round(Number(creator.preis || 0) * 100));
+      const vipDays = Number(creator.vip_days ?? creator.vip_dauer ?? 30);
+      const feePct  = creator.application_fee_pct != null ? Number(creator.application_fee_pct) : null;
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      success_url: `${BASE_URL}/stripe/success`,
-      cancel_url: `${BASE_URL}/stripe/cancel`,
-      customer_email: q.from?.username ? undefined : undefined, // optional: setze hier eine Mail, wenn du eine hast
-      // on‑the‑fly Price für Abo: genau vipDays Tage Laufzeit
-      line_items: [
-        {
-          quantity: 1,
-          price_data: {
-            currency: "eur",
-            unit_amount: amountCents,
-            recurring: { interval: "day", interval_count: vipDays }, // exakt vipDays
-            product_data: {
-              name: `VIP‑Bot Zugang – ${row.creator_id.slice(0,8)}`,
-              metadata: { creator_id: row.creator_id }
-            }
+      const lineItem = {
+        quantity: 1,
+        price_data: {
+          currency: "eur",
+          unit_amount: amountCents,
+          recurring: { interval: "day", interval_count: vipDays },
+          product_data: {
+            name: `VIP‑Bot Zugang – ${row.creator_id.slice(0,8)}`,
+            metadata: { creator_id: row.creator_id }
           }
         }
-      ],
-      allow_promotion_codes: true,
+      };
 
-      // Destination Charge (Geld direkt an das Model), Fee für dich
-      subscription_data: {
-        transfer_data: { destination: creator.stripe_account_id },
-        ...(feePct != null ? { application_fee_percent: feePct } : {}),
-        metadata: {
-          creator_id: row.creator_id,
-          telegram_id: userId,
-          chat_id: String(chatId),
-          vip_days: String(vipDays)
-        }
-      },
+      let session;
 
-      // IMPORTANT: KEIN { stripeAccount: ... } Header bei Destination Charges verwenden!
-      metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId) }
-    });
+      if (transfersActive) {
+        // ✅ Destination Charge (empfohlen für Subs)
+        session = await stripe.checkout.sessions.create({
+          mode: "subscription",
+          success_url: `${BASE_URL}/stripe/success`,
+          cancel_url: `${BASE_URL}/stripe/cancel`,
+          allow_promotion_codes: true,
+          line_items: [lineItem],
+          subscription_data: {
+            transfer_data: { destination: acct },
+            ...(feePct != null ? { application_fee_percent: feePct } : {}),
+            metadata: {
+              creator_id: row.creator_id,
+              telegram_id: userId,
+              chat_id: String(chatId),
+              vip_days: String(vipDays)
+            }
+          },
+          // 👉 wichtig: auch auf der Session speichern, falls wir die Sub nicht gleich nachladen
+          metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
+        });
+      } else if (cardActive) {
+        // 🔁 Fallback: Direct Charge (bis transfers aktiv sind)
+        session = await stripe.checkout.sessions.create({
+          mode: "subscription",
+          success_url: `${BASE_URL}/stripe/success`,
+          cancel_url: `${BASE_URL}/stripe/cancel`,
+          allow_promotion_codes: true,
+          line_items: [lineItem],
+          subscription_data: {
+            ...(feePct != null ? { application_fee_percent: feePct } : {}),
+            metadata: {
+              creator_id: row.creator_id,
+              telegram_id: userId,
+              chat_id: String(chatId),
+              vip_days: String(vipDays)
+            }
+          },
+          metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
+        }, { stripeAccount: acct }); // << Direct Charge
+      } else {
+        // ❌ Weder transfers noch card_payments aktiv → Onboarding anstoßen
+        const link = await stripe.accountLinks.create({
+          account: acct,
+          type: "account_onboarding",
+          refresh_url: `${BASE_URL}/stripe/connect/refresh?creator_id=${encodeURIComponent(row.creator_id)}`,
+          return_url:  `${BASE_URL}/stripe/connect/return?creator_id=${encodeURIComponent(row.creator_id)}`
+        });
+        await bot.answerCallbackQuery(q.id, { text: "Stripe‑Onboarding noch unvollständig. Bitte abschließen." });
+        await bot.sendMessage(chatId, `⚠️ Bitte schließe dein Stripe‑Onboarding ab:\n${link.url}`);
+        return;
+      }
 
-    await bot.answerCallbackQuery(q.id);
-    await bot.sendMessage(chatId, "💳 Bezahlung starten:", {
-      reply_markup: { inline_keyboard: [[{ text: "Jetzt bezahlen", url: session.url }]] }
-    });
-  } catch (e) {
-    console.error("Stripe session error:", e.message);
-    await bot.answerCallbackQuery(q.id, { text: "Stripe Fehler. Später erneut versuchen." });
-  }
-});
-
+      await bot.answerCallbackQuery(q.id);
+      await bot.sendMessage(chatId, "💳 Bezahlung starten:", {
+        reply_markup: { inline_keyboard: [[{ text: "Jetzt bezahlen", url: session.url }]] }
+      });
+    } catch (e) {
+      console.error("Stripe session error:", e.message);
+      await bot.answerCallbackQuery(q.id, { text: "Stripe Fehler. Später erneut versuchen." });
+    }
+  });
 
   // /status
   bot.onText(/\/status/, async (msg) => {
@@ -407,7 +441,7 @@ app.get("/stripe/connect/return", (req, res) => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Stripe – Webhook (⚠️ in Stripe „Events on Connected accounts“ anhaken!)
+// Stripe – Webhook (⚠️ in Stripe Dashboard: „Events on connected accounts“ aktivieren)
 // ──────────────────────────────────────────────────────────────────────────────
 app.post("/stripe/webhook", async (req, res) => {
   if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.sendStatus(200);
@@ -419,82 +453,128 @@ app.post("/stripe/webhook", async (req, res) => {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
- if (event.type === "checkout.session.completed") {
-  const s = event.data.object;
-  const creator_id = s.metadata?.creator_id || s.subscription_data?.metadata?.creator_id;
-  const telegram_id = s.metadata?.telegram_id || s.subscription_data?.metadata?.telegram_id;
-  const chat_id = s.metadata?.chat_id || s.subscription_data?.metadata?.chat_id;
-  const vipDaysMeta = s.subscription_data?.metadata?.vip_days;
-
-  try {
-    const cfg = await getCreatorCfgById(creator_id);
-    const days = Number(vipDaysMeta ?? cfg?.vip_days ?? cfg?.vip_dauer ?? 30);
-    const vip_bis = addDaysISO(days);
-
-    const { data: vipRow } = await supabase.from("vip_users").upsert(
-      { creator_id, telegram_id, chat_id, status: "aktiv", vip_bis },
-      { onConflict: "creator_id,telegram_id" }
-    ).select("telegram_id, chat_id").maybeSingle();
-
-    if (cfg?.welcome_text) await bot.sendMessage(Number(chat_id), cfg.welcome_text);
-    if (cfg?.regeln_text)  await bot.sendMessage(Number(chat_id), cfg.regeln_text);
-
-    const ok = await sendDynamicInvite(cfg?.group_chat_id, vipRow?.chat_id || chat_id);
-    if (!ok && cfg?.gruppe_link) {
-      await bot.sendMessage(Number(chat_id), `🎟️ Dein VIP‑Zugang: ${cfg.gruppe_link}`);
+  // Helper: retrieve with correct account when needed (Direct Charge webhooks)
+  const retrieveSub = async (subId) => {
+    if (!subId) return null;
+    try {
+      if (event.account) {
+        // Event kam von einem Connected Account (Direct Charge)
+        return await stripe.subscriptions.retrieve(subId, { stripeAccount: event.account });
+      }
+      return await stripe.subscriptions.retrieve(subId);
+    } catch (e) {
+      console.error("retrieveSub error:", e.message);
+      return null;
     }
-  } catch (e) { console.error("Fulfill error:", e.message); }
-}
+  };
 
-// ➕ NEU: jede bezahlte Rechnung verlängert erneut um vipDays
-if (event.type === "invoice.paid") {
-  const inv = event.data.object;
+  if (event.type === "checkout.session.completed") {
+    const s = event.data.object;
 
-  try {
-    // Wir holen die Subscription-Metadaten (creator_id, telegram_id, chat_id, vip_days)
-    const subId = inv.subscription;
-    if (!subId) return;
+    // Unsere Metadaten liegen sicher auf der Session (und zusätzlich auf der Subscription)
+    let creator_id = s.metadata?.creator_id || null;
+    let telegram_id = s.metadata?.telegram_id || null;
+    let chat_id     = s.metadata?.chat_id || null;
+    let vipDaysMeta = s.metadata?.vip_days || null;
 
-    const subscription = await stripe.subscriptions.retrieve(subId);
-    const md = subscription?.metadata || {};
-    const creator_id = md.creator_id;
-    const telegram_id = md.telegram_id;
-    const chat_id = md.chat_id;
-    const vipDays = Number(md.vip_days || 30);
+    // Falls vip_days nur auf der Subscription gelandet ist, holen wir sie nach
+    if (!vipDaysMeta && s.subscription) {
+      const sub = await retrieveSub(s.subscription);
+      if (sub?.metadata) {
+        vipDaysMeta = vipDaysMeta || sub.metadata.vip_days;
+        creator_id  = creator_id  || sub.metadata.creator_id;
+        telegram_id = telegram_id || sub.metadata.telegram_id;
+        chat_id     = chat_id     || sub.metadata.chat_id;
+      }
+    }
 
-    if (!creator_id || !telegram_id) return;
+    try {
+      const cfg = await getCreatorCfgById(creator_id);
+      const days = Number(vipDaysMeta ?? cfg?.vip_days ?? cfg?.vip_dauer ?? 30);
+      const vip_bis = addDaysISO(days);
 
-    // vip_bis ab heutigem Tag (oder alternativ ab invoice.period_end) um vipDays verlängern
-    const vip_bis = addDaysISO(vipDays);
+      const { data: vipRow } = await supabase.from("vip_users").upsert(
+        { creator_id, telegram_id, chat_id, status: "aktiv", vip_bis },
+        { onConflict: "creator_id,telegram_id" }
+      ).select("telegram_id, chat_id").maybeSingle();
 
-    await supabase.from("vip_users").upsert(
-      { creator_id, telegram_id, chat_id, status: "aktiv", vip_bis },
-      { onConflict: "creator_id,telegram_id" }
-    );
+      if (cfg?.welcome_text) await bot.sendMessage(Number(chat_id), cfg.welcome_text);
+      if (cfg?.regeln_text)  await bot.sendMessage(Number(chat_id), cfg.regeln_text);
 
-    // Optional Info an User:
-    // await bot.sendMessage(Number(chat_id || telegram_id), `✅ Dein VIP wurde verlängert bis ${vip_bis}.`);
-  } catch (e) {
-    console.error("invoice.paid handler error:", e.message);
+      const ok = await sendDynamicInvite(cfg?.group_chat_id, vipRow?.chat_id || chat_id);
+      if (!ok && cfg?.gruppe_link) {
+        await bot.sendMessage(Number(chat_id), `🎟️ Dein VIP‑Zugang: ${cfg.gruppe_link}`);
+      }
+    } catch (e) { console.error("Fulfill error:", e.message); }
   }
-}
 
-// Optional: Kündigungen erkennen
-if (event.type === "customer.subscription.deleted") {
-  const sub = event.data.object;
-  try {
-    const md = sub?.metadata || {};
-    const creator_id = md.creator_id;
-    const telegram_id = md.telegram_id;
-    if (!creator_id || !telegram_id) return;
+  // ➕ Jede bezahlte Rechnung verlängert erneut um vipDays
+  if (event.type === "invoice.paid") {
+    const inv = event.data.object;
 
-    await supabase.from("vip_users").update({ status: "gekündigt" })
-      .eq("creator_id", creator_id).eq("telegram_id", telegram_id);
-  } catch (e) {
-    console.error("subscription.deleted handler error:", e.message);
+    try {
+      const subId = inv.subscription;
+      if (!subId) return;
+
+      const subscription = await retrieveSub(subId);
+      const md = subscription?.metadata || {};
+      const creator_id = md.creator_id;
+      const telegram_id = md.telegram_id;
+      const chat_id = md.chat_id;
+      const vipDays = Number(md.vip_days || 30);
+
+      if (!creator_id || !telegram_id) return;
+
+      // vip_bis ab heute (alternativ: ab invoice.period_end → inv.lines.data[0].period.end*1000)
+      const vip_bis = addDaysISO(vipDays);
+
+      await supabase.from("vip_users").upsert(
+        { creator_id, telegram_id, chat_id, status: "aktiv", vip_bis },
+        { onConflict: "creator_id,telegram_id" }
+      );
+    } catch (e) {
+      console.error("invoice.paid handler error:", e.message);
+    }
   }
-}
+
+  // Optional: Kündigungen erkennen
+  if (event.type === "customer.subscription.deleted") {
+    const sub = event.data.object;
+    try {
+      const md = sub?.metadata || {};
+      const creator_id = md.creator_id;
+      const telegram_id = md.telegram_id;
+      if (!creator_id || !telegram_id) return;
+
+      await supabase.from("vip_users").update({ status: "gekündigt" })
+        .eq("creator_id", creator_id).eq("telegram_id", telegram_id);
+    } catch (e) {
+      console.error("subscription.deleted handler error:", e.message);
+    }
+  }
+
   res.json({ received: true });
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Debug: Account‑Status prüfen (Capabilities, Requirements etc.)
+// ──────────────────────────────────────────────────────────────────────────────
+app.get("/api/stripe/account-status", async (req, res) => {
+  try {
+    const acct = req.query.acct;
+    if (!acct) return res.status(400).json({ error: "acct fehlt" });
+    const account = await stripe.accounts.retrieve(String(acct));
+    res.json({
+      id: account.id,
+      payouts_enabled: account.payouts_enabled,
+      charges_enabled: account.charges_enabled,
+      disabled_reason: account.requirements?.disabled_reason,
+      currently_due: account.requirements?.currently_due,
+      capabilities: account.capabilities
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
