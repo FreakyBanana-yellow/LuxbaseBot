@@ -238,63 +238,81 @@ async function bootstrapTelegram() {
     );
   });
 
-  // Inline‑Button „Jetzt bezahlen“ → Stripe Checkout (Direct Charge auf Connected Account)
-  bot.on("callback_query", async (q) => {
-    if (q.data !== "pay_now") return;
-    const chatId = q.message.chat.id;
-    const userId = String(q.from.id);
+ // Inline‑Button „Jetzt bezahlen“ → Stripe Checkout (Subscription + Destination Charge)
+bot.on("callback_query", async (q) => {
+  if (q.data !== "pay_now") return;
+  const chatId = q.message.chat.id;
+  const userId = String(q.from.id);
 
-    const { data: row } = await supabase.from("vip_users")
-      .select("creator_id").eq("telegram_id", userId)
-      .order("letzter_kontakt", { ascending: false }).limit(1).maybeSingle();
+  const { data: row } = await supabase.from("vip_users")
+    .select("creator_id").eq("telegram_id", userId)
+    .order("letzter_kontakt", { ascending: false }).limit(1).maybeSingle();
 
-    if (!row?.creator_id) { await bot.answerCallbackQuery(q.id, { text: "Bitte zuerst /start nutzen." }); return; }
+  if (!row?.creator_id) { await bot.answerCallbackQuery(q.id, { text: "Bitte zuerst /start nutzen." }); return; }
 
-    const creator = await getCreatorCfgById(row.creator_id);
-    if (!creator) { await bot.answerCallbackQuery(q.id, { text: "Konfiguration fehlt." }); return; }
-    if (!stripe) { await bot.answerCallbackQuery(q.id, { text: "Stripe nicht konfiguriert." }); return; }
-    if (!creator.stripe_account_id) {
-      await bot.answerCallbackQuery(q.id, { text: "Stripe nicht verbunden. Bitte in den VIP‑Einstellungen verbinden." });
-      return;
-    }
+  const creator = await getCreatorCfgById(row.creator_id);
+  if (!creator) { await bot.answerCallbackQuery(q.id, { text: "Konfiguration fehlt." }); return; }
+  if (!stripe) { await bot.answerCallbackQuery(q.id, { text: "Stripe nicht konfiguriert." }); return; }
+  if (!creator.stripe_account_id) {
+    await bot.answerCallbackQuery(q.id, { text: "Stripe nicht verbunden. Bitte in den VIP‑Einstellungen verbinden." });
+    return;
+  }
 
-    try {
-      const amount = Math.max(0, Math.round(Number(creator.preis || 0) * 100));
-      const feePct = Number(creator.application_fee_pct || 0);
-      const application_fee_amount = feePct ? Math.round((amount * feePct) / 100) : undefined;
+  try {
+    const amountCents = Math.max(0, Math.round(Number(creator.preis || 0) * 100)); // z.B. 49.00 -> 4900
+    const vipDays = Number(creator.vip_days ?? creator.vip_dauer ?? 30); // 30 als Fallback
 
-      const lineItem = creator.stripe_price_id
-        ? { price: creator.stripe_price_id, quantity: 1 }
-        : {
-            price_data: {
-              currency: "eur",
-              product_data: { name: `VIP ${row.creator_id.slice(0,8)}` },
-              unit_amount: amount
-            },
-            quantity: 1
-          };
+    // Prozentuale Plattform-Fee (falls vorhanden)
+    const feePct = creator.application_fee_pct != null ? Number(creator.application_fee_pct) : null;
 
-      const session = await stripe.checkout.sessions.create(
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      success_url: `${BASE_URL}/stripe/success`,
+      cancel_url: `${BASE_URL}/stripe/cancel`,
+      customer_email: q.from?.username ? undefined : undefined, // optional: setze hier eine Mail, wenn du eine hast
+      // on‑the‑fly Price für Abo: genau vipDays Tage Laufzeit
+      line_items: [
         {
-          mode: "payment",
-          line_items: [lineItem],
-          success_url: `${BASE_URL}/stripe/success`,
-          cancel_url: `${BASE_URL}/stripe/cancel`,
-          payment_intent_data: application_fee_amount ? { application_fee_amount } : undefined,
-          metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId) }
-        },
-        { stripeAccount: creator.stripe_account_id } // Direct Charge
-      );
+          quantity: 1,
+          price_data: {
+            currency: "eur",
+            unit_amount: amountCents,
+            recurring: { interval: "day", interval_count: vipDays }, // exakt vipDays
+            product_data: {
+              name: `VIP‑Bot Zugang – ${row.creator_id.slice(0,8)}`,
+              metadata: { creator_id: row.creator_id }
+            }
+          }
+        }
+      ],
+      allow_promotion_codes: true,
 
-      await bot.answerCallbackQuery(q.id);
-      await bot.sendMessage(chatId, "💳 Bezahlung starten:", {
-        reply_markup: { inline_keyboard: [[{ text: "Jetzt bezahlen", url: session.url }]] }
-      });
-    } catch (e) {
-      console.error("Stripe session error:", e.message);
-      await bot.answerCallbackQuery(q.id, { text: "Stripe Fehler. Später erneut versuchen." });
-    }
-  });
+      // Destination Charge (Geld direkt an das Model), Fee für dich
+      subscription_data: {
+        transfer_data: { destination: creator.stripe_account_id },
+        ...(feePct != null ? { application_fee_percent: feePct } : {}),
+        metadata: {
+          creator_id: row.creator_id,
+          telegram_id: userId,
+          chat_id: String(chatId),
+          vip_days: String(vipDays)
+        }
+      },
+
+      // IMPORTANT: KEIN { stripeAccount: ... } Header bei Destination Charges verwenden!
+      metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId) }
+    });
+
+    await bot.answerCallbackQuery(q.id);
+    await bot.sendMessage(chatId, "💳 Bezahlung starten:", {
+      reply_markup: { inline_keyboard: [[{ text: "Jetzt bezahlen", url: session.url }]] }
+    });
+  } catch (e) {
+    console.error("Stripe session error:", e.message);
+    await bot.answerCallbackQuery(q.id, { text: "Stripe Fehler. Später erneut versuchen." });
+  }
+});
+
 
   // /status
   bot.onText(/\/status/, async (msg) => {
