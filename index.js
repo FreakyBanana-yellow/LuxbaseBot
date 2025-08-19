@@ -22,7 +22,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
-const STRIPE_ACCOUNT_COUNTRY = process.env.STRIPE_ACCOUNT_COUNTRY || ""; // optional, z.B. "DE"
+const STRIPE_ACCOUNT_COUNTRY = process.env.STRIPE_ACCOUNT_COUNTRY || ""; // optional
 
 if (!BOT_TOKEN || !BASE_URL || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("❌ ENV fehlt. Setze: BOT_TOKEN, BASE_URL, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY");
@@ -33,9 +33,8 @@ const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Hinweise für DB (optional, nicht zwingend):
-//
-// create table if not exists invite_links (
+// (optional) Tabelle invite_links:
+// create table invite_links (
 //   id uuid primary key default gen_random_uuid(),
 //   creator_id text not null,
 //   telegram_id text not null,
@@ -47,14 +46,11 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: {
 //   used boolean not null default false,
 //   created_at timestamptz not null default now()
 // );
-// create index if not exists invite_links_creator_idx on invite_links (creator_id);
-// create index if not exists invite_links_telegram_idx on invite_links (telegram_id);
 // ──────────────────────────────────────────────────────────────────────────────
 
 const nowTS = () => new Date().toISOString().replace("T"," ").replace("Z","");
 const todayISO = () => new Date().toISOString().slice(0,10);
 const addDaysISO = (d) => new Date(Date.now()+d*864e5).toISOString().slice(0,10);
-const log = (...args) => console.log("ℹ️", ...args);
 
 // Zustimmungs-Tracker (In-Memory) für Alterscheck & Regeln vor Zahlung
 // key = `${creator_id}:${telegram_id}` → { age: boolean, rules: boolean }
@@ -74,15 +70,14 @@ async function getCreatorCfgById(creator_id) {
   return data || null;
 }
 
-// Einmallink pro Model (1 Mitglied, 15 Min gültig) + DB-Logging mit klaren Logs
+// Einmallink + Logging
 async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or_user_id }) {
   if (!group_chat_id) {
     console.error("sendDynamicInvite: group_chat_id fehlt");
     return { ok: false, reason: "NO_GROUP" };
   }
   try {
-    // Einmallink erzeugen
-    const expire = Math.floor(Date.now() / 1000) + (15 * 60);
+    const expire = Math.floor(Date.now() / 1000) + (15 * 60); // 15 Min
     const resp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/createChatInviteLink`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -95,17 +90,15 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
     }).then(r => r.json());
 
     if (!(resp?.ok && resp?.result?.invite_link)) {
-      console.error("❌ createChatInviteLink failed:", resp);
+      console.error("createChatInviteLink failed:", resp);
       return { ok: false, reason: "TG_API" };
     }
 
     const invite_link = resp.result.invite_link;
     const expires_at = new Date(expire * 1000).toISOString();
 
-    // →→ Verstärktes Logging beim Insert:
-    const { data: ins, error: insErr } = await supabase
-      .from("invite_links")
-      .insert({
+    try {
+      await supabase.from("invite_links").insert({
         creator_id,
         telegram_id: String(chat_id_or_user_id),
         chat_id: String(chat_id_or_user_id),
@@ -114,14 +107,9 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
         expires_at,
         member_limit: 1,
         used: false
-      })
-      .select("id, created_at")
-      .maybeSingle();
-
-    if (insErr) {
-      console.error("❌ invite_links insert error:", insErr);
-    } else {
-      console.log("✅ invite_links inserted:", ins);
+      });
+    } catch (dbErr) {
+      console.warn("invite_links insert warn:", dbErr?.message || dbErr);
     }
 
     await bot.sendMessage(Number(chat_id_or_user_id), `🎟️ Dein VIP‑Zugang (15 Min gültig): ${invite_link}`);
@@ -173,7 +161,7 @@ async function bootstrapTelegram() {
     console.error("❌ bootstrapTelegram error:", err.message);
   }
 
-  // Auto‑Bind beim Hinzufügen in Gruppe (optional hilfreich)
+  // Auto‑Bind beim Hinzufügen in Gruppe
   bot.on("my_chat_member", async (upd) => {
     const chat = upd.chat;
     const me = upd.new_chat_member;
@@ -188,24 +176,20 @@ async function bootstrapTelegram() {
       }).then(r => r.json());
 
       const adminIds = (adminsResp?.result || []).map(a => String(a?.user?.id)).filter(Boolean);
-      if (!adminIds.length) {
-        await bot.sendMessage(chat.id, "👋 Ich bin jetzt hier. Bitte stelle sicher, dass ich Admin bin.");
-        return;
-      }
+      if (!adminIds.length) return;
 
       const { data: matches, error } = await supabase
         .from("creator_config")
         .select("creator_id, telegram_id")
         .in("telegram_id", adminIds);
 
-      if (error) { console.error("match admin error:", error.message); return; }
-      if (!matches || matches.length !== 1) { return; }
+      if (error || !matches || matches.length !== 1) return;
 
       await supabase.from("creator_config")
         .update({ group_chat_id: String(chat.id) })
         .eq("creator_id", matches[0].creator_id);
 
-      await bot.sendMessage(chat.id, "✅ Gruppe wurde automatisch verknüpft. Bitte gib mir Admin‑Rechte für Einladungen & Kicks.");
+      await bot.sendMessage(chat.id, "✅ Gruppe verknüpft. Bitte gib mir Admin‑Rechte für Einladungen & Kicks.");
     } catch (e) {
       console.error("my_chat_member auto-bind error:", e?.message || e);
     }
@@ -257,7 +241,6 @@ async function bootstrapTelegram() {
     const price = Number(creator.preis || 0).toFixed(0);
     const days  = Number(creator.vip_days ?? creator.vip_dauer ?? 30);
 
-    // 1) Begrüßung + Buttons für Alterscheck & Regeln
     const text = [
       `👋 Willkommen, ${msg.from.first_name}!`,
       `Preis: ${price} €`,
@@ -273,7 +256,6 @@ async function bootstrapTelegram() {
         [{ text: "🔞 Ich bin 18+", callback_data: `consent_age:${creator_id}` }],
         [{ text: "📜 Regeln anzeigen", callback_data: `show_rules:${creator_id}` }],
         [{ text: "✅ Regeln akzeptieren", callback_data: `consent_rules:${creator_id}` }],
-        // Der „Jetzt bezahlen“-Button erscheint erst, wenn beide bestätigt wurden
       ]
     };
 
@@ -286,14 +268,12 @@ async function bootstrapTelegram() {
     const userId = String(q.from.id);
     const data = q.data || "";
 
-    // helper: safe getter
     const getState = (creator_id) => {
       const key = `${creator_id}:${userId}`;
       if (!consentState.has(key)) consentState.set(key, { age: false, rules: false });
       return { key, state: consentState.get(key) };
     };
 
-    // Alterscheck bestätigen
     if (data.startsWith("consent_age:")) {
       const creator_id = data.split(":")[1];
       const { key, state } = getState(creator_id);
@@ -304,7 +284,6 @@ async function bootstrapTelegram() {
       return;
     }
 
-    // Regeln anzeigen
     if (data.startsWith("show_rules:")) {
       const creator_id = data.split(":")[1];
       const creator = await getCreatorCfgById(creator_id);
@@ -314,7 +293,6 @@ async function bootstrapTelegram() {
       return;
     }
 
-    // Regeln akzeptieren
     if (data.startsWith("consent_rules:")) {
       const creator_id = data.split(":")[1];
       const { key, state } = getState(creator_id);
@@ -325,7 +303,7 @@ async function bootstrapTelegram() {
       return;
     }
 
-    // Payment starten (nur wenn explizit angezeigt/geklickt)
+    // Payment starten (direkt Link senden)
     if (data === "pay_now") {
       const { data: row } = await supabase.from("vip_users")
         .select("creator_id").eq("telegram_id", userId)
@@ -366,11 +344,10 @@ async function bootstrapTelegram() {
           }
         };
 
-        console.log("⚙️ creating checkout session for", { acct, userId, chatId, vipDays, amountCents, feePct });
-
         let session;
+
         if (transfersActive && payoutsEnabled) {
-          // Destination charge über Plattform
+          // Destination charge (Plattform bucht, Auto‑Transfer)
           session = await stripe.checkout.sessions.create({
             mode: "subscription",
             success_url: `${BASE_URL}/stripe/success`,
@@ -380,14 +357,12 @@ async function bootstrapTelegram() {
             subscription_data: {
               transfer_data: { destination: acct },
               ...(feePct != null ? { application_fee_percent: feePct } : {}),
-              metadata: {
-                creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays)
-              }
+              metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
             },
             metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
           });
         } else if (cardActive) {
-          // Direct charge im Connected Account
+          // Direct charge (im Connected Account)
           session = await stripe.checkout.sessions.create({
             mode: "subscription",
             success_url: `${BASE_URL}/stripe/success`,
@@ -396,9 +371,7 @@ async function bootstrapTelegram() {
             line_items: [lineItem],
             subscription_data: {
               ...(feePct != null ? { application_fee_percent: feePct } : {}),
-              metadata: {
-                creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays)
-              }
+              metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
             },
             metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
           }, { stripeAccount: acct });
@@ -413,12 +386,9 @@ async function bootstrapTelegram() {
           return;
         }
 
-        console.log("✅ checkout session created", { id: session.id, url: session.url });
-
-        await bot.answerCallbackQuery(q.id);
-        await bot.sendMessage(chatId, "💳 Bezahlung starten:", {
-          reply_markup: { inline_keyboard: [[{ text: "Jetzt bezahlen", url: session.url }]] }
-        });
+        // ⬇️ Sofort den Stripe‑Link senden (kein zweiter Button)
+        await bot.answerCallbackQuery(q.id, { text: "Weiter zu Stripe…" });
+        await bot.sendMessage(chatId, `💳 Öffne Stripe, um zu bezahlen:\n${session.url}`);
       } catch (e) {
         console.error("Stripe session error:", e.message);
         await bot.answerCallbackQuery(q.id, { text: "Stripe Fehler. Später erneut versuchen." });
@@ -426,13 +396,12 @@ async function bootstrapTelegram() {
     }
   });
 
-  // sobald irgendeine Message → Kontaktzeit aktualisieren
+  // jede Message → Kontaktzeit
   bot.on("message", async (msg) => {
     if (!msg?.from) return;
     await supabase.from("vip_users").update({ letzter_kontakt: nowTS() }).eq("telegram_id", String(msg.from.id));
   });
 
-  // Helper: zeigt Pay-Button erst, wenn beides bestätigt
   async function maybeOfferPay(creator_id, chatId, userId) {
     const key = `${creator_id}:${userId}`;
     const s = consentState.get(key) || { age: false, rules: false };
@@ -509,16 +478,12 @@ app.get("/api/stripe/connect-redirect", async (req, res) => {
   }
 });
 
-// minimale Landing‑Seiten
-app.get("/stripe/connect/refresh", (req, res) => {
-  res.send("🔄 Onboarding abgebrochen – bitte in Luxbase erneut auf „Stripe verbinden“ klicken.");
-});
-app.get("/stripe/connect/return", (req, res) => {
-  res.send("✅ Onboarding abgeschlossen (oder fortgesetzt). Du kannst dieses Fenster schließen.");
-});
+// Mini-Landing
+app.get("/stripe/connect/refresh", (_, res) => res.send("🔄 Onboarding abgebrochen – bitte erneut auf „Stripe verbinden“ klicken."));
+app.get("/stripe/connect/return",  (_, res) => res.send("✅ Onboarding abgeschlossen (oder fortgesetzt). Du kannst dieses Fenster schließen."));
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Stripe – Webhook
+// Stripe – Webhook (achte im Dashboard auf „Events on connected accounts“)
 // ──────────────────────────────────────────────────────────────────────────────
 app.post("/stripe/webhook", async (req, res) => {
   if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.sendStatus(200);
@@ -543,13 +508,6 @@ app.post("/stripe/webhook", async (req, res) => {
 
   if (event.type === "checkout.session.completed") {
     const s = event.data.object;
-
-    log("webhook: checkout.session.completed", {
-      eventAccount: event.account || null,
-      sessionId: s.id,
-      subscription: s.subscription || null,
-      sessMeta: s.metadata || null
-    });
 
     let creator_id = s.metadata?.creator_id || null;
     let telegram_id = s.metadata?.telegram_id || null;
@@ -576,9 +534,12 @@ app.post("/stripe/webhook", async (req, res) => {
         { onConflict: "creator_id,telegram_id" }
       ).select("telegram_id, chat_id").maybeSingle();
 
-      if (cfg?.welcome_text) await bot.sendMessage(Number(chat_id), cfg.welcome_text);
-      if (cfg?.regeln_text)  await bot.sendMessage(Number(chat_id), cfg.regeln_text);
+      // Nur Welcome senden (Regeln nicht doppeln)
+      if (cfg?.welcome_text) {
+        await bot.sendMessage(Number(chat_id), cfg.welcome_text);
+      }
 
+      // Invite verschicken
       if (cfg?.group_chat_id) {
         const result = await sendDynamicInvitePerModel({
           creator_id,
@@ -642,12 +603,13 @@ app.post("/stripe/webhook", async (req, res) => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Daily Cron – Reminder & Kick
+/** Daily Cron – Reminder & Kick */
 // ──────────────────────────────────────────────────────────────────────────────
 cron.schedule("0 8 * * *", async () => {
   const today = todayISO();
   const warnDate = addDaysISO(5);
 
+  // Warnen
   const { data: warnUsers } = await supabase.from("vip_users")
     .select("telegram_id, chat_id, vip_bis")
     .gte("vip_bis", today).lte("vip_bis", warnDate).eq("status", "aktiv");
@@ -656,6 +618,7 @@ cron.schedule("0 8 * * *", async () => {
       `⏰ Dein VIP läuft am ${u.vip_bis} ab. Verlängere rechtzeitig mit /start → „Jetzt bezahlen“.`);
   }
 
+  // Abgelaufen → kicken
   const { data: expired } = await supabase.from("vip_users")
     .select("creator_id, telegram_id, chat_id, vip_bis")
     .lt("vip_bis", today).eq("status", "aktiv");
