@@ -74,7 +74,7 @@ async function getCreatorCfgById(creator_id) {
   return data || null;
 }
 
-// Einmallink pro Model (1 Mitglied, 15 Min gültig) + optionales DB-Logging
+// Einmallink pro Model (1 Mitglied, 15 Min gültig) + DB-Logging mit klaren Logs
 async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or_user_id }) {
   if (!group_chat_id) {
     console.error("sendDynamicInvite: group_chat_id fehlt");
@@ -95,16 +95,17 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
     }).then(r => r.json());
 
     if (!(resp?.ok && resp?.result?.invite_link)) {
-      console.error("createChatInviteLink failed:", resp);
+      console.error("❌ createChatInviteLink failed:", resp);
       return { ok: false, reason: "TG_API" };
     }
 
     const invite_link = resp.result.invite_link;
     const expires_at = new Date(expire * 1000).toISOString();
 
-    // Optional: in DB protokollieren (ignoriert Fehler)
-    try {
-      await supabase.from("invite_links").insert({
+    // →→ Verstärktes Logging beim Insert:
+    const { data: ins, error: insErr } = await supabase
+      .from("invite_links")
+      .insert({
         creator_id,
         telegram_id: String(chat_id_or_user_id),
         chat_id: String(chat_id_or_user_id),
@@ -113,9 +114,14 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
         expires_at,
         member_limit: 1,
         used: false
-      });
-    } catch (dbErr) {
-      console.warn("invite_links insert warn:", dbErr?.message || dbErr);
+      })
+      .select("id, created_at")
+      .maybeSingle();
+
+    if (insErr) {
+      console.error("❌ invite_links insert error:", insErr);
+    } else {
+      console.log("✅ invite_links inserted:", ins);
     }
 
     await bot.sendMessage(Number(chat_id_or_user_id), `🎟️ Dein VIP‑Zugang (15 Min gültig): ${invite_link}`);
@@ -360,6 +366,8 @@ async function bootstrapTelegram() {
           }
         };
 
+        console.log("⚙️ creating checkout session for", { acct, userId, chatId, vipDays, amountCents, feePct });
+
         let session;
         if (transfersActive && payoutsEnabled) {
           // Destination charge über Plattform
@@ -404,6 +412,8 @@ async function bootstrapTelegram() {
           await bot.sendMessage(chatId, `⚠️ Bitte schließe dein Stripe‑Onboarding ab:\n${link.url}`);
           return;
         }
+
+        console.log("✅ checkout session created", { id: session.id, url: session.url });
 
         await bot.answerCallbackQuery(q.id);
         await bot.sendMessage(chatId, "💳 Bezahlung starten:", {
@@ -508,7 +518,7 @@ app.get("/stripe/connect/return", (req, res) => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Stripe – Webhook (achte im Dashboard auf „Events on connected accounts“)
+// Stripe – Webhook
 // ──────────────────────────────────────────────────────────────────────────────
 app.post("/stripe/webhook", async (req, res) => {
   if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.sendStatus(200);
