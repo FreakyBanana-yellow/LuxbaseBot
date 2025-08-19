@@ -36,6 +36,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: {
 const nowTS = () => new Date().toISOString().replace("T"," ").replace("Z","");
 const todayISO = () => new Date().toISOString().slice(0,10);
 const addDaysISO = (d) => new Date(Date.now()+d*864e5).toISOString().slice(0,10);
+const log = (...args) => console.log("ℹ️", ...args);
 
 async function getCreatorCfgById(creator_id) {
   if (!creator_id) return null;
@@ -67,6 +68,8 @@ async function sendDynamicInvite(group_chat_id, chat_id_or_user_id) {
     if (resp?.ok && resp?.result?.invite_link) {
       await bot.sendMessage(Number(chat_id_or_user_id), `🎟️ Dein VIP‑Zugang: ${resp.result.invite_link}`);
       return true;
+    } else {
+      console.error("createChatInviteLink failed:", resp);
     }
   } catch (e) { console.error("InviteLink error:", e.message); }
   return false;
@@ -265,6 +268,15 @@ async function bootstrapTelegram() {
       const caps = account.capabilities || {};
       const transfersActive = caps.transfers === "active";
       const cardActive      = caps.card_payments === "active";
+      const payoutsEnabled  = !!account.payouts_enabled;
+
+      console.log("Stripe acct status", {
+        acct,
+        transfers: caps.transfers,
+        card_payments: caps.card_payments,
+        payouts_enabled: account.payouts_enabled,
+        charges_enabled: account.charges_enabled,
+      });
 
       const amountCents = Math.max(0, Math.round(Number(creator.preis || 0) * 100));
       const vipDays = Number(creator.vip_days ?? creator.vip_dauer ?? 30);
@@ -285,7 +297,7 @@ async function bootstrapTelegram() {
 
       let session;
 
-      if (transfersActive) {
+      if (transfersActive && payoutsEnabled) {
         // ✅ Destination Charge (empfohlen für Subs)
         session = await stripe.checkout.sessions.create({
           mode: "subscription",
@@ -303,11 +315,10 @@ async function bootstrapTelegram() {
               vip_days: String(vipDays)
             }
           },
-          // 👉 wichtig: auch auf der Session speichern, falls wir die Sub nicht gleich nachladen
           metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
         });
       } else if (cardActive) {
-        // 🔁 Fallback: Direct Charge (bis transfers aktiv sind)
+        // 🔁 Fallback: Direct Charge (bis transfers/payouts aktiv sind)
         session = await stripe.checkout.sessions.create({
           mode: "subscription",
           success_url: `${BASE_URL}/stripe/success`,
@@ -326,7 +337,7 @@ async function bootstrapTelegram() {
           metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
         }, { stripeAccount: acct }); // << Direct Charge
       } else {
-        // ❌ Weder transfers noch card_payments aktiv → Onboarding anstoßen
+        // ❌ Weder transfers/payouts noch card_payments aktiv → Onboarding anstoßen
         const link = await stripe.accountLinks.create({
           account: acct,
           type: "account_onboarding",
@@ -360,6 +371,36 @@ async function bootstrapTelegram() {
       row ? `Status: <b>${row.status||"—"}</b>\nVIP bis: <b>${row.vip_bis||"—"}</b>` : "Noch kein VIP. Nutze /start.",
       { parse_mode: "HTML" }
     );
+  });
+
+  // /vip – manueller Versand des Zugangslinks (Soforthilfe)
+  bot.onText(/^\/vip$/, async (msg) => {
+    const userId = String(msg.from.id);
+
+    const { data: row } = await supabase.from("vip_users")
+      .select("creator_id, chat_id, status, vip_bis")
+      .eq("telegram_id", userId)
+      .order("letzter_kontakt", { ascending: false })
+      .limit(1).maybeSingle();
+
+    if (!row?.creator_id) { await bot.sendMessage(msg.chat.id, "Ich finde keinen aktiven VIP‑Kauf. Nutze /start noch einmal."); return; }
+
+    const cfg = await getCreatorCfgById(row.creator_id);
+    if (!cfg) { await bot.sendMessage(msg.chat.id, "Creator‑Konfiguration nicht gefunden."); return; }
+
+    if (row.status !== "aktiv") {
+      await bot.sendMessage(msg.chat.id, `Dein Status ist „${row.status||"—"}“. Wenn du verlängerst, bekommst du wieder Zugang.`);
+      return;
+    }
+
+    const ok = await sendDynamicInvite(cfg.group_chat_id, msg.chat.id);
+    if (!ok) {
+      if (cfg.gruppe_link) {
+        await bot.sendMessage(msg.chat.id, `🎟️ Dein VIP‑Zugang: ${cfg.gruppe_link}`);
+      } else {
+        await bot.sendMessage(msg.chat.id, "⚠️ Einladungslink konnte nicht erstellt werden. Bitte prüfe: Bot ist Admin in der Zielgruppe und darf Einladungslinks erstellen.");
+      }
+    }
   });
 
   // jede Message → Kontaktzeit
@@ -471,6 +512,13 @@ app.post("/stripe/webhook", async (req, res) => {
   if (event.type === "checkout.session.completed") {
     const s = event.data.object;
 
+    log("webhook: checkout.session.completed", {
+      eventAccount: event.account || null,
+      sessionId: s.id,
+      subscription: s.subscription || null,
+      sessMeta: s.metadata || null
+    });
+
     // Unsere Metadaten liegen sicher auf der Session (und zusätzlich auf der Subscription)
     let creator_id = s.metadata?.creator_id || null;
     let telegram_id = s.metadata?.telegram_id || null;
@@ -488,6 +536,8 @@ app.post("/stripe/webhook", async (req, res) => {
       }
     }
 
+    log("invite_prepare", { creator_id, telegram_id, chat_id, vipDaysMeta });
+
     try {
       const cfg = await getCreatorCfgById(creator_id);
       const days = Number(vipDaysMeta ?? cfg?.vip_days ?? cfg?.vip_dauer ?? 30);
@@ -502,8 +552,13 @@ app.post("/stripe/webhook", async (req, res) => {
       if (cfg?.regeln_text)  await bot.sendMessage(Number(chat_id), cfg.regeln_text);
 
       const ok = await sendDynamicInvite(cfg?.group_chat_id, vipRow?.chat_id || chat_id);
-      if (!ok && cfg?.gruppe_link) {
-        await bot.sendMessage(Number(chat_id), `🎟️ Dein VIP‑Zugang: ${cfg.gruppe_link}`);
+      if (!ok) {
+        log("invite_dynamic_failed", { group_chat_id: cfg?.group_chat_id, chat_id: vipRow?.chat_id || chat_id });
+        if (cfg?.gruppe_link) {
+          await bot.sendMessage(Number(chat_id), `🎟️ Dein VIP‑Zugang: ${cfg.gruppe_link}`);
+        } else {
+          await bot.sendMessage(Number(chat_id), "⚠️ Konnte keinen Einladungslink erstellen. Bitte kontaktiere den Creator – die Gruppe ist noch nicht verknüpft oder mir fehlen Rechte.");
+        }
       }
     } catch (e) { console.error("Fulfill error:", e.message); }
   }
@@ -525,7 +580,7 @@ app.post("/stripe/webhook", async (req, res) => {
 
       if (!creator_id || !telegram_id) return;
 
-      // vip_bis ab heute (alternativ: ab invoice.period_end → inv.lines.data[0].period.end*1000)
+      // vip_bis ab heute (alternativ: ab invoice.period_end)
       const vip_bis = addDaysISO(vipDays);
 
       await supabase.from("vip_users").upsert(
