@@ -33,26 +33,13 @@ const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// (optional) Tabelle invite_links:
-// create table invite_links (
-//   id uuid primary key default gen_random_uuid(),
-//   creator_id text not null,
-//   telegram_id text not null,
-//   chat_id text,
-//   group_chat_id text not null,
-//   invite_link text not null,
-//   expires_at timestamptz not null,
-//   member_limit int not null default 1,
-//   used boolean not null default false,
-//   created_at timestamptz not null default now()
-// );
+// Helpers
 // ──────────────────────────────────────────────────────────────────────────────
-
 const nowTS = () => new Date().toISOString().replace("T"," ").replace("Z","");
 const todayISO = () => new Date().toISOString().slice(0,10);
 const addDaysISO = (d) => new Date(Date.now()+d*864e5).toISOString().slice(0,10);
 
-// Zustimmungs-Tracker (In-Memory) für Alterscheck & Regeln vor Zahlung
+// Consent-Tracker (In-Memory) für Alterscheck & Regeln vor Zahlung
 // key = `${creator_id}:${telegram_id}` → { age: boolean, rules: boolean }
 const consentState = new Map();
 
@@ -70,7 +57,6 @@ async function getCreatorCfgById(creator_id) {
   return data || null;
 }
 
-// Einmallink + Logging
 async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or_user_id }) {
   if (!group_chat_id) {
     console.error("sendDynamicInvite: group_chat_id fehlt");
@@ -97,6 +83,7 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
     const invite_link = resp.result.invite_link;
     const expires_at = new Date(expire * 1000).toISOString();
 
+    // optionales Logging (falls Tabelle existiert)
     try {
       await supabase.from("invite_links").insert({
         creator_id,
@@ -109,7 +96,7 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
         used: false
       });
     } catch (dbErr) {
-      console.warn("invite_links insert warn:", dbErr?.message || dbErr);
+      // nicht kritisch
     }
 
     await bot.sendMessage(Number(chat_id_or_user_id), `🎟️ Dein VIP‑Zugang (15 Min gültig): ${invite_link}`);
@@ -137,9 +124,8 @@ const telegramPath = `/bot${BOT_TOKEN}`;
 const telegramWebhook = `${BASE_URL}${telegramPath}`;
 const bot = new TelegramBot(BOT_TOKEN, { webHook: true });
 
-// Express-Handler + Logging der Updates
+// Express-Handler + optionales Logging
 app.post(telegramPath, (req, res) => {
-  console.log("📩 Incoming Telegram Update:", JSON.stringify(req.body, null, 2));
   try { bot.processUpdate(req.body); } catch (err) { console.error("processUpdate error:", err); }
   res.sendStatus(200);
 });
@@ -150,13 +136,9 @@ async function bootstrapTelegram() {
     await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: "" })
     });
-    const setResp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: telegramWebhook })
     }).then(r => r.json());
-    console.log("Telegram setWebHook response:", setResp);
-
-    const info = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo`).then(r => r.json());
-    console.log("Telegram getWebhookInfo:", JSON.stringify(info, null, 2));
   } catch (err) {
     console.error("❌ bootstrapTelegram error:", err.message);
   }
@@ -195,11 +177,19 @@ async function bootstrapTelegram() {
     }
   });
 
-  // /start (DM & Gruppe) – mit Alterscheck & Regeln vor Zahlung
+  // /start (DM & Gruppe) – robust: creator_<id>, <id>, link_creator_<id>
   bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
-    const payload = (match?.[1] || "").trim();
-    const m = /^creator_(.+)$/i.exec(payload);
-    const creator_id = m ? m[1] : null;
+    const raw = (match?.[1] || "").trim();
+
+    // Käufer: /start creator_<uuid>  ODER nur <uuid>
+    let creator_id = null;
+    const m1 = /^creator_([A-Za-z0-9-]+)$/i.exec(raw);
+    const m2 = /^([A-Za-z0-9-]{20,})$/i.exec(raw); // nackte UUID erlauben
+    if (m1) creator_id = m1[1];
+    else if (m2) creator_id = m2[1];
+
+    // Admin: /start link_creator_<uuid>
+    const adminLink = /^link_creator_([A-Za-z0-9-]+)$/i.exec(raw);
 
     // In Gruppe: binden, wenn Payload vorhanden
     if (msg.chat.type === "group" || msg.chat.type === "supergroup") {
@@ -212,19 +202,33 @@ async function bootstrapTelegram() {
       return;
     }
 
-    // DM: Flow starten
+    // ADMIN‑Flow (DM): Owner ↔ Creator koppeln
+    if (adminLink && msg.chat.type === "private") {
+      const cId = adminLink[1];
+      await supabase.from("creator_config").update({
+        telegram_id: String(msg.from.id),
+        admin_telegram_username: msg.from.username || null
+      }).eq("creator_id", cId);
+
+      await bot.sendMessage(
+        msg.chat.id,
+        "✅ Dein Telegram wurde mit deinem Luxbase‑Account verknüpft.\n" +
+        "Füge mich jetzt als Admin in deiner VIP‑Gruppe hinzu – ich verknüpfe sie automatisch."
+      );
+      return;
+    }
+
+    // Käufer‑Flow (DM)
     if (!creator_id) {
-      await bot.sendMessage(msg.chat.id, "❌ Ungültiger Start‑Link. Bitte den Link aus deinen VIP‑Einstellungen verwenden.");
+      await bot.sendMessage(msg.chat.id,
+        "❌ Ungültiger Start‑Link.\nÖffne den Link direkt aus den VIP‑Einstellungen (er enthält eine Kennung).");
       return;
     }
 
     const creator = await getCreatorCfgById(creator_id);
-    if (!creator) {
-      await bot.sendMessage(msg.chat.id, "❌ Creator‑Konfiguration nicht gefunden.");
-      return;
-    }
+    if (!creator) { await bot.sendMessage(msg.chat.id, "❌ Creator‑Konfiguration nicht gefunden."); return; }
 
-    // User registrieren/aktualisieren (Status: gestartet)
+    // Käufer registrieren/aktualisieren
     await supabase.from("vip_users").upsert({
       creator_id,
       telegram_id: String(msg.from.id),
@@ -262,7 +266,7 @@ async function bootstrapTelegram() {
     await bot.sendMessage(msg.chat.id, text, { reply_markup: kb });
   });
 
-  // Callback-Handler: Alterscheck / Regeln / Pay
+  // Callback-Handler
   bot.on("callback_query", async (q) => {
     const chatId = q.message?.chat?.id;
     const userId = String(q.from.id);
@@ -303,24 +307,36 @@ async function bootstrapTelegram() {
       return;
     }
 
-    // Payment starten (direkt Link senden)
-    if (data === "pay_now") {
-      const { data: row } = await supabase.from("vip_users")
-        .select("creator_id").eq("telegram_id", userId)
-        .order("letzter_kontakt", { ascending: false }).limit(1).maybeSingle();
+    // Payment starten
+    if (data.startsWith("pay_now")) {
+      const parts = data.split(":");
+      let creatorForPay = parts[1]; // erwartet: pay_now:<creator_id>
 
-      if (!row?.creator_id) { await bot.answerCallbackQuery(q.id, { text: "Bitte zuerst /start nutzen." }); return; }
+      // Fallback: alte Buttons ohne Suffix
+      if (!creatorForPay) {
+        const { data: row } = await supabase.from("vip_users")
+          .select("creator_id").eq("telegram_id", userId)
+          .order("letzter_kontakt", { ascending: false }).limit(1).maybeSingle();
+        creatorForPay = row?.creator_id;
+      }
 
-      const creator = await getCreatorCfgById(row.creator_id);
+      if (!creatorForPay) {
+        await bot.answerCallbackQuery(q.id, { text: "Bitte zuerst /start über den VIP‑Link nutzen." });
+        return;
+      }
+
+      const creator = await getCreatorCfgById(creatorForPay);
       if (!creator) { await bot.answerCallbackQuery(q.id, { text: "Konfiguration fehlt." }); return; }
-      if (!stripe) { await bot.answerCallbackQuery(q.id, { text: "Stripe nicht konfiguriert." }); return; }
+      if (!stripe)  { await bot.answerCallbackQuery(q.id, { text: "Stripe nicht konfiguriert." }); return; }
+
       const acct = creator.stripe_account_id;
       if (!acct) {
-        await bot.answerCallbackQuery(q.id, { text: "Stripe nicht verbunden. Bitte in den VIP‑Einstellungen verbinden." });
+        await bot.answerCallbackQuery(q.id, { text: "Stripe nicht verbunden. Bitte Setup prüfen." });
         return;
       }
 
       try {
+        // Capabilities
         const account = await stripe.accounts.retrieve(acct);
         const caps = account.capabilities || {};
         const transfersActive = caps.transfers === "active";
@@ -338,8 +354,8 @@ async function bootstrapTelegram() {
             unit_amount: amountCents,
             recurring: { interval: "day", interval_count: vipDays },
             product_data: {
-              name: `VIP‑Bot Zugang – ${row.creator_id.slice(0,8)}`,
-              metadata: { creator_id: row.creator_id }
+              name: `VIP‑Bot Zugang – ${creatorForPay.slice(0,8)}`,
+              metadata: { creator_id: creatorForPay }
             }
           }
         };
@@ -347,7 +363,7 @@ async function bootstrapTelegram() {
         let session;
 
         if (transfersActive && payoutsEnabled) {
-          // Destination charge (Plattform bucht, Auto‑Transfer)
+          // Destination charge
           session = await stripe.checkout.sessions.create({
             mode: "subscription",
             success_url: `${BASE_URL}/stripe/success`,
@@ -357,12 +373,12 @@ async function bootstrapTelegram() {
             subscription_data: {
               transfer_data: { destination: acct },
               ...(feePct != null ? { application_fee_percent: feePct } : {}),
-              metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
+              metadata: { creator_id: creatorForPay, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
             },
-            metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
+            metadata: { creator_id: creatorForPay, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
           });
         } else if (cardActive) {
-          // Direct charge (im Connected Account)
+          // Direct charge im verbundenen Account
           session = await stripe.checkout.sessions.create({
             mode: "subscription",
             success_url: `${BASE_URL}/stripe/success`,
@@ -371,22 +387,21 @@ async function bootstrapTelegram() {
             line_items: [lineItem],
             subscription_data: {
               ...(feePct != null ? { application_fee_percent: feePct } : {}),
-              metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
+              metadata: { creator_id: creatorForPay, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
             },
-            metadata: { creator_id: row.creator_id, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
+            metadata: { creator_id: creatorForPay, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
           }, { stripeAccount: acct });
         } else {
           const link = await stripe.accountLinks.create({
             account: acct, type: "account_onboarding",
-            refresh_url: `${BASE_URL}/stripe/connect/refresh?creator_id=${encodeURIComponent(row.creator_id)}`,
-            return_url:  `${BASE_URL}/stripe/connect/return?creator_id=${encodeURIComponent(row.creator_id)}`
+            refresh_url: `${BASE_URL}/stripe/connect/refresh?creator_id=${encodeURIComponent(creatorForPay)}`,
+            return_url:  `${BASE_URL}/stripe/connect/return?creator_id=${encodeURIComponent(creatorForPay)}`
           });
           await bot.answerCallbackQuery(q.id, { text: "Stripe‑Onboarding unvollständig. Bitte abschließen." });
           await bot.sendMessage(chatId, `⚠️ Bitte schließe dein Stripe‑Onboarding ab:\n${link.url}`);
           return;
         }
 
-        // ⬇️ Sofort den Stripe‑Link senden (kein zweiter Button)
         await bot.answerCallbackQuery(q.id, { text: "Weiter zu Stripe…" });
         await bot.sendMessage(chatId, `💳 Öffne Stripe, um zu bezahlen:\n${session.url}`);
       } catch (e) {
@@ -401,17 +416,22 @@ async function bootstrapTelegram() {
     if (!msg?.from) return;
     await supabase.from("vip_users").update({ letzter_kontakt: nowTS() }).eq("telegram_id", String(msg.from.id));
   });
+}
 
-  async function maybeOfferPay(creator_id, chatId, userId) {
-    const key = `${creator_id}:${userId}`;
-    const s = consentState.get(key) || { age: false, rules: false };
-    if (s.age && s.rules) {
-      await bot.sendMessage(Number(chatId), "Alles klar – du kannst jetzt bezahlen.", {
-        reply_markup: { inline_keyboard: [[{ text: "💳 Jetzt bezahlen", callback_data: "pay_now" }]] }
-      });
-    } else {
-      await bot.sendMessage(Number(chatId), `Noch offen: ${s.age ? "" : "🔞 Alterscheck "} ${s.rules ? "" : "📜 Regeln akzeptieren"}`.trim());
-    }
+async function maybeOfferPay(creator_id, chatId, userId) {
+  const key = `${creator_id}:${userId}`;
+  const s = consentState.get(key) || { age: false, rules: false };
+  if (s.age && s.rules) {
+    await bot.sendMessage(Number(chatId), "Alles klar – du kannst jetzt bezahlen.", {
+      reply_markup: {
+        inline_keyboard: [[{ text: "💳 Jetzt bezahlen", callback_data: `pay_now:${creator_id}` }]]
+      }
+    });
+  } else {
+    await bot.sendMessage(
+      Number(chatId),
+      `Noch offen: ${s.age ? "" : "🔞 Alterscheck "}${s.rules ? "" : "📜 Regeln akzeptieren"}`.trim()
+    );
   }
 }
 
@@ -478,7 +498,6 @@ app.get("/api/stripe/connect-redirect", async (req, res) => {
   }
 });
 
-// Mini-Landing
 app.get("/stripe/connect/refresh", (_, res) => res.send("🔄 Onboarding abgebrochen – bitte erneut auf „Stripe verbinden“ klicken."));
 app.get("/stripe/connect/return",  (_, res) => res.send("✅ Onboarding abgeschlossen (oder fortgesetzt). Du kannst dieses Fenster schließen."));
 
@@ -534,12 +553,10 @@ app.post("/stripe/webhook", async (req, res) => {
         { onConflict: "creator_id,telegram_id" }
       ).select("telegram_id, chat_id").maybeSingle();
 
-      // Nur Welcome senden (Regeln nicht doppeln)
       if (cfg?.welcome_text) {
         await bot.sendMessage(Number(chat_id), cfg.welcome_text);
       }
 
-      // Invite verschicken
       if (cfg?.group_chat_id) {
         const result = await sendDynamicInvitePerModel({
           creator_id,
@@ -603,7 +620,7 @@ app.post("/stripe/webhook", async (req, res) => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-/** Daily Cron – Reminder & Kick */
+// Daily Cron – Reminder & Kick
 // ──────────────────────────────────────────────────────────────────────────────
 cron.schedule("0 8 * * *", async () => {
   const today = todayISO();
