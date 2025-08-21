@@ -191,16 +191,75 @@ async function bootstrapTelegram() {
     // Admin: /start link_creator_<uuid>
     const adminLink = /^link_creator_([A-Za-z0-9-]+)$/i.exec(raw);
 
-    // In Gruppe: binden, wenn Payload vorhanden
-    if (msg.chat.type === "group" || msg.chat.type === "supergroup") {
-      if (!creator_id) {
-        await bot.sendMessage(msg.chat.id, "❓ Kein Creator‑Payload. Nutze den „Gruppe verbinden“-Button in den Einstellungen.");
-        return;
-      }
-      await supabase.from("creator_config").update({ group_chat_id: String(msg.chat.id) }).eq("creator_id", creator_id);
+    // In Gruppe: Payload bevorzugt, sonst Auto‑Bind über Admin‑Match
+if (msg.chat.type === "group" || msg.chat.type === "supergroup") {
+  try {
+    if (creator_id) {
+      await supabase.from("creator_config")
+        .update({ group_chat_id: String(msg.chat.id) })
+        .eq("creator_id", creator_id);
       await bot.sendMessage(msg.chat.id, "✅ Gruppe verbunden! Bitte Admin‑Rechte geben.");
       return;
     }
+
+    // Kein Payload? → Admins holen & mit creator_config.telegram_id matchen
+    const adminsResp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: msg.chat.id })
+    }).then(r => r.json());
+
+    const adminIds = (adminsResp?.result || [])
+      .map(a => String(a?.user?.id))
+      .filter(Boolean);
+
+    if (!adminIds.length) {
+      await bot.sendMessage(msg.chat.id, "⚠️ Konnte keine Admins erkennen. Bitte Bot als Admin hinzufügen und erneut /start senden.");
+      return;
+    }
+
+    const { data: matches, error } = await supabase
+      .from("creator_config")
+      .select("creator_id, telegram_id")
+      .in("telegram_id", adminIds);
+
+    if (error) {
+      await bot.sendMessage(msg.chat.id, "⚠️ DB‑Fehler beim Verknüpfen. Bitte später erneut versuchen.");
+      return;
+    }
+
+    if (!matches || matches.length === 0) {
+      await bot.sendMessage(
+        msg.chat.id,
+        "ℹ️ Kein verknüpfbarer Creator gefunden.\n" +
+        "Bitte öffne im **Privatchat** mit mir den Link „Telegram verbinden“ in Luxbase → danach mich hier erneut als Admin hinzufügen."
+      );
+      return;
+    }
+
+    if (matches.length > 1) {
+      await bot.sendMessage(
+        msg.chat.id,
+        "⚠️ Mehrere Creator‑Admins erkannt. Bitte nur den gewünschten Creator‑Admin in dieser Gruppe belassen oder zunächst nur einen Creator verknüpfen."
+      );
+      return;
+    }
+
+    const foundCreator = matches[0].creator_id;
+    await supabase.from("creator_config")
+      .update({ group_chat_id: String(msg.chat.id) })
+      .eq("creator_id", foundCreator);
+
+    await bot.sendMessage(
+      msg.chat.id,
+      "✅ Gruppe automatisch verknüpft.\nBitte stelle sicher, dass ich Admin‑Rechte habe (Einladen & Kicken)."
+    );
+  } catch (e) {
+    console.error("group /start autobind error:", e?.message || e);
+    await bot.sendMessage(msg.chat.id, "⚠️ Konnte die Gruppe nicht verknüpfen. Bitte später erneut versuchen.");
+  }
+  return;
+}
 
     // ADMIN‑Flow (DM): Owner ↔ Creator koppeln
     if (adminLink && msg.chat.type === "private") {
