@@ -1,4 +1,4 @@
-// index.js – Luxbot @ Render (Telegram + Stripe Connect + Supabase)
+// index.js – Luxbot @ Render (Telegram + Stripe Connect + Supabase + Voice-Intro)
 import express from "express";
 import dotenv from "dotenv";
 import TelegramBot from "node-telegram-bot-api";
@@ -43,11 +43,35 @@ const addDaysISO = (d) => new Date(Date.now()+d*864e5).toISOString().slice(0,10)
 // key = `${creator_id}:${telegram_id}` → { age: boolean, rules: boolean }
 const consentState = new Map();
 
+// Mini-"Session" NUR für Creator-Wizard (Voice)
+const modelWizard = new Map(); // key = telegram_id, value = { expectVoice:bool, expectCaption:bool }
+function getMW(userId) {
+  const k = String(userId);
+  if (!modelWizard.has(k)) modelWizard.set(k, { expectVoice: false, expectCaption: false });
+  return modelWizard.get(k);
+}
+
+// CreatorConfig per creator_id (inkl. Voice-Felder)
 async function getCreatorCfgById(creator_id) {
   if (!creator_id) return null;
   const { data, error } = await supabase
     .from("creator_config")
-    .select("creator_id, preis, vip_days, vip_dauer, gruppe_link, group_chat_id, stripe_price_id, stripe_account_id, application_fee_pct, welcome_text, regeln_text")
+    .select(`
+      creator_id,
+      preis,
+      vip_days,
+      vip_dauer,
+      gruppe_link,
+      group_chat_id,
+      stripe_price_id,
+      stripe_account_id,
+      application_fee_pct,
+      welcome_text,
+      regeln_text,
+      voice_enabled,
+      voice_file_id,
+      voice_caption
+    `)
     .eq("creator_id", creator_id)
     .maybeSingle();
   if (error) {
@@ -55,6 +79,47 @@ async function getCreatorCfgById(creator_id) {
     return null;
   }
   return data || null;
+}
+
+// Creator anhand Telegram-ID (Owner/Model) finden
+async function getCreatorByTelegramId(telegramId) {
+  const { data, error } = await supabase
+    .from("creator_config")
+    .select("creator_id, telegram_id, voice_enabled, voice_file_id, voice_caption")
+    .eq("telegram_id", String(telegramId))
+    .maybeSingle();
+  if (error) {
+    console.error("getCreatorByTelegramId error:", error.message);
+    return null;
+  }
+  return data || null;
+}
+
+// Voice file_id speichern/aktivieren
+async function saveCreatorVoice(telegramId, fileId) {
+  const { error } = await supabase
+    .from("creator_config")
+    .update({
+      voice_file_id: fileId,
+      voice_enabled: true,
+      voice_updated_at: new Date().toISOString()
+    })
+    .eq("telegram_id", String(telegramId));
+  if (error) console.error("saveCreatorVoice error:", error.message);
+  return !error;
+}
+
+// Caption speichern/ändern
+async function saveCreatorVoiceCaption(telegramId, caption) {
+  const { error } = await supabase
+    .from("creator_config")
+    .update({
+      voice_caption: caption,
+      voice_updated_at: new Date().toISOString()
+    })
+    .eq("telegram_id", String(telegramId));
+  if (error) console.error("saveCreatorVoiceCaption error:", error.message);
+  return !error;
 }
 
 async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or_user_id }) {
@@ -118,7 +183,7 @@ app.use((req, res, next) => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Telegram – Webhook
+/** Telegram – Webhook */
 // ──────────────────────────────────────────────────────────────────────────────
 const telegramPath = `/bot${BOT_TOKEN}`;
 const telegramWebhook = `${BASE_URL}${telegramPath}`;
@@ -177,6 +242,104 @@ async function bootstrapTelegram() {
     }
   });
 
+  // ──────────────────────────────────────────────────────────────────────────
+  // CREATOR WIZARD: /setup_voice  (im DM mit dem Model)
+  // ──────────────────────────────────────────────────────────────────────────
+  bot.onText(/^\/setup_voice\b/, async (msg) => {
+    if (msg.chat.type !== "private") return; // Wizard nur im DM
+    const me = await getCreatorByTelegramId(msg.from.id);
+    if (!me) {
+      await bot.sendMessage(msg.chat.id, "Dieser Bereich ist nur für verifizierte Creator freigeschaltet.");
+      return;
+    }
+    const st = getMW(msg.from.id);
+    st.expectVoice = true;
+    st.expectCaption = false;
+
+    await bot.sendMessage(
+      msg.chat.id,
+      "🎙️ Willst du jetzt eine Begrüßungs‑Sprachnachricht aufnehmen?\n" +
+      "• Bitte nutze den **runden Voice‑Button**.\n• Länge: **5–20 Sekunden**.",
+      {
+        reply_markup: {
+          keyboard: [[{ text: "Aufnehmen" }], [{ text: "Abbrechen" }]],
+          resize_keyboard: true,
+          one_time_keyboard: true
+        }
+      }
+    );
+  });
+
+  // Wizard-Text: Aufnehmen / Abbrechen + Caption-Eingabe
+  bot.on("text", async (msg) => {
+    const st = getMW(msg.from.id);
+
+    // Caption wird gerade erwartet?
+    if (st.expectCaption && msg.chat.type === "private") {
+      const me = await getCreatorByTelegramId(msg.from.id);
+      if (!me) return;
+      const caption = (msg.text || "").trim().slice(0, 200);
+      const ok = await saveCreatorVoiceCaption(msg.from.id, caption);
+      st.expectCaption = false;
+      await bot.sendMessage(
+        msg.chat.id,
+        ok ? "Caption gespeichert ✅" : "Konnte die Caption nicht speichern 😕. Versuch’s nochmal."
+      );
+      return;
+    }
+
+    // Wizard-Steuerung (nur DM)
+    if (msg.chat.type === "private") {
+      if (msg.text === "Aufnehmen") {
+        const me = await getCreatorByTelegramId(msg.from.id);
+        if (!me) return;
+        st.expectVoice = true;
+        await bot.sendMessage(msg.chat.id, "Okay, bitte sende mir jetzt deine **Sprachnachricht** (runder Button).");
+        return;
+      }
+      if (msg.text === "Abbrechen") {
+        st.expectVoice = false;
+        st.expectCaption = false;
+        await bot.sendMessage(msg.chat.id, "Alles klar. Du kannst jederzeit /setup_voice senden.", { reply_markup: { remove_keyboard: true } });
+        return;
+      }
+    }
+  });
+
+  // Voice empfangen (nur Creator im DM)
+  bot.on("voice", async (msg) => {
+    if (msg.chat.type !== "private") return; // nur im DM
+    const me = await getCreatorByTelegramId(msg.from.id);
+    if (!me) return; // nur Creator dürfen hier speichern
+
+    const st = getMW(msg.from.id);
+    if (!st.expectVoice) return; // nur wenn Wizard aktiv
+
+    const fileId = msg.voice?.file_id;
+    if (!fileId) {
+      await bot.sendMessage(msg.chat.id, "Konnte die Sprachnachricht nicht lesen. Bitte nochmal senden.");
+      return;
+    }
+
+    const ok = await saveCreatorVoice(msg.from.id, fileId);
+    st.expectVoice = false;
+
+    if (!ok) {
+      await bot.sendMessage(msg.chat.id, "Speichern fehlgeschlagen 😕 – bitte nochmal probieren.");
+      return;
+    }
+
+    await bot.sendMessage(msg.chat.id, "Nice! ✅ Deine Voicenachricht ist gespeichert.", { reply_markup: { remove_keyboard: true } });
+    await bot.sendMessage(msg.chat.id, "Möchtest du sie testweise abspielen oder eine Caption hinzufügen?", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "▶️ Test abspielen", callback_data: "voice_test" }],
+          [{ text: "📝 Caption hinzufügen", callback_data: "voice_caption" }]
+        ]
+      }
+    });
+  });
+
   // /start (DM & Gruppe) – robust: creator_<id>, <id>, link_creator_<id>
   bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     const raw = (match?.[1] || "").trim();
@@ -192,74 +355,74 @@ async function bootstrapTelegram() {
     const adminLink = /^link_creator_([A-Za-z0-9-]+)$/i.exec(raw);
 
     // In Gruppe: Payload bevorzugt, sonst Auto‑Bind über Admin‑Match
-if (msg.chat.type === "group" || msg.chat.type === "supergroup") {
-  try {
-    if (creator_id) {
-      await supabase.from("creator_config")
-        .update({ group_chat_id: String(msg.chat.id) })
-        .eq("creator_id", creator_id);
-      await bot.sendMessage(msg.chat.id, "✅ Gruppe verbunden! Bitte Admin‑Rechte geben.");
+    if (msg.chat.type === "group" || msg.chat.type === "supergroup") {
+      try {
+        if (creator_id) {
+          await supabase.from("creator_config")
+            .update({ group_chat_id: String(msg.chat.id) })
+            .eq("creator_id", creator_id);
+          await bot.sendMessage(msg.chat.id, "✅ Gruppe verbunden! Bitte Admin‑Rechte geben.");
+          return;
+        }
+
+        // Kein Payload? → Admins holen & mit creator_config.telegram_id matchen
+        const adminsResp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id: msg.chat.id })
+        }).then(r => r.json());
+
+        const adminIds = (adminsResp?.result || [])
+          .map(a => String(a?.user?.id))
+          .filter(Boolean);
+
+        if (!adminIds.length) {
+          await bot.sendMessage(msg.chat.id, "⚠️ Konnte keine Admins erkennen. Bitte Bot als Admin hinzufügen und erneut /start senden.");
+          return;
+        }
+
+        const { data: matches, error } = await supabase
+          .from("creator_config")
+          .select("creator_id, telegram_id")
+          .in("telegram_id", adminIds);
+
+        if (error) {
+          await bot.sendMessage(msg.chat.id, "⚠️ DB‑Fehler beim Verknüpfen. Bitte später erneut versuchen.");
+          return;
+        }
+
+        if (!matches || matches.length === 0) {
+          await bot.sendMessage(
+            msg.chat.id,
+            "ℹ️ Kein verknüpfbarer Creator gefunden.\n" +
+            "Bitte öffne im **Privatchat** mit mir den Link „Telegram verbinden“ in Luxbase → danach mich hier erneut als Admin hinzufügen."
+          );
+          return;
+        }
+
+        if (matches.length > 1) {
+          await bot.sendMessage(
+            msg.chat.id,
+            "⚠️ Mehrere Creator‑Admins erkannt. Bitte nur den gewünschten Creator‑Admin in dieser Gruppe belassen oder zunächst nur einen Creator verknüpfen."
+          );
+          return;
+        }
+
+        const foundCreator = matches[0].creator_id;
+        await supabase.from("creator_config")
+          .update({ group_chat_id: String(msg.chat.id) })
+          .eq("creator_id", foundCreator);
+
+        await bot.sendMessage(
+          msg.chat.id,
+          "✅ Gruppe automatisch verknüpft.\nBitte stelle sicher, dass ich Admin‑Rechte habe (Einladen & Kicken)."
+        );
+      } catch (e) {
+        console.error("group /start autobind error:", e?.message || e);
+        await bot.sendMessage(msg.chat.id, "⚠️ Konnte die Gruppe nicht verknüpfen. Bitte später erneut versuchen.");
+      }
       return;
     }
-
-    // Kein Payload? → Admins holen & mit creator_config.telegram_id matchen
-    const adminsResp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: msg.chat.id })
-    }).then(r => r.json());
-
-    const adminIds = (adminsResp?.result || [])
-      .map(a => String(a?.user?.id))
-      .filter(Boolean);
-
-    if (!adminIds.length) {
-      await bot.sendMessage(msg.chat.id, "⚠️ Konnte keine Admins erkennen. Bitte Bot als Admin hinzufügen und erneut /start senden.");
-      return;
-    }
-
-    const { data: matches, error } = await supabase
-      .from("creator_config")
-      .select("creator_id, telegram_id")
-      .in("telegram_id", adminIds);
-
-    if (error) {
-      await bot.sendMessage(msg.chat.id, "⚠️ DB‑Fehler beim Verknüpfen. Bitte später erneut versuchen.");
-      return;
-    }
-
-    if (!matches || matches.length === 0) {
-      await bot.sendMessage(
-        msg.chat.id,
-        "ℹ️ Kein verknüpfbarer Creator gefunden.\n" +
-        "Bitte öffne im **Privatchat** mit mir den Link „Telegram verbinden“ in Luxbase → danach mich hier erneut als Admin hinzufügen."
-      );
-      return;
-    }
-
-    if (matches.length > 1) {
-      await bot.sendMessage(
-        msg.chat.id,
-        "⚠️ Mehrere Creator‑Admins erkannt. Bitte nur den gewünschten Creator‑Admin in dieser Gruppe belassen oder zunächst nur einen Creator verknüpfen."
-      );
-      return;
-    }
-
-    const foundCreator = matches[0].creator_id;
-    await supabase.from("creator_config")
-      .update({ group_chat_id: String(msg.chat.id) })
-      .eq("creator_id", foundCreator);
-
-    await bot.sendMessage(
-      msg.chat.id,
-      "✅ Gruppe automatisch verknüpft.\nBitte stelle sicher, dass ich Admin‑Rechte habe (Einladen & Kicken)."
-    );
-  } catch (e) {
-    console.error("group /start autobind error:", e?.message || e);
-    await bot.sendMessage(msg.chat.id, "⚠️ Konnte die Gruppe nicht verknüpfen. Bitte später erneut versuchen.");
-  }
-  return;
-}
 
     // ADMIN‑Flow (DM): Owner ↔ Creator koppeln
     if (adminLink && msg.chat.type === "private") {
@@ -272,7 +435,8 @@ if (msg.chat.type === "group" || msg.chat.type === "supergroup") {
       await bot.sendMessage(
         msg.chat.id,
         "✅ Dein Telegram wurde mit deinem Luxbase‑Account verknüpft.\n" +
-        "Füge mich jetzt als Admin in deiner VIP‑Gruppe hinzu – ich verknüpfe sie automatisch."
+        "Füge mich jetzt als Admin in deiner VIP‑Gruppe hinzu – ich verknüpfe sie automatisch.\n\n" +
+        "Tipp: Du kannst jetzt /setup_voice senden und eine Begrüßungs‑Sprachnachricht aufnehmen. 🎙️"
       );
       return;
     }
@@ -286,6 +450,17 @@ if (msg.chat.type === "group" || msg.chat.type === "supergroup") {
 
     const creator = await getCreatorCfgById(creator_id);
     if (!creator) { await bot.sendMessage(msg.chat.id, "❌ Creator‑Konfiguration nicht gefunden."); return; }
+
+    // Voice-Intro (falls vorhanden) direkt vorspielen
+    if (creator?.voice_enabled && creator?.voice_file_id && msg.chat.type === "private") {
+      try {
+        await bot.sendVoice(msg.chat.id, creator.voice_file_id, {
+          caption: creator.voice_caption || undefined
+        });
+      } catch (e) {
+        console.error("sendVoice /start error:", e.message);
+      }
+    }
 
     // Käufer registrieren/aktualisieren
     await supabase.from("vip_users").upsert({
@@ -325,12 +500,36 @@ if (msg.chat.type === "group" || msg.chat.type === "supergroup") {
     await bot.sendMessage(msg.chat.id, text, { reply_markup: kb });
   });
 
-  // Callback-Handler
+  // Callback-Handler (inkl. Voice-Test/Caption)
   bot.on("callback_query", async (q) => {
     const chatId = q.message?.chat?.id;
     const userId = String(q.from.id);
     const data = q.data || "";
 
+    // === Voice-Callbacks für Creator (früh prüfen & ggf. return) ===
+    if (data === "voice_test") {
+      const me = await getCreatorByTelegramId(userId);
+      if (!me) { await bot.answerCallbackQuery(q.id); return; }
+      if (!me.voice_file_id) {
+        await bot.answerCallbackQuery(q.id, { text: "Keine Voicenachricht gespeichert.", show_alert: true });
+        return;
+      }
+      await bot.sendVoice(chatId, me.voice_file_id, { caption: me.voice_caption || undefined });
+      await bot.answerCallbackQuery(q.id, { text: "Abgespielt!" });
+      return;
+    }
+
+    if (data === "voice_caption") {
+      const me = await getCreatorByTelegramId(userId);
+      if (!me) { await bot.answerCallbackQuery(q.id); return; }
+      const st = getMW(userId);
+      st.expectCaption = true;
+      await bot.answerCallbackQuery(q.id);
+      await bot.sendMessage(chatId, "Schick mir jetzt deine Caption (max. 200 Zeichen).");
+      return;
+    }
+
+    // === AB HIER: bestehende Logik (Consent / Pay) ===
     const getState = (creator_id) => {
       const key = `${creator_id}:${userId}`;
       if (!consentState.has(key)) consentState.set(key, { age: false, rules: false });
@@ -391,6 +590,7 @@ if (msg.chat.type === "group" || msg.chat.type === "supergroup") {
       const acct = creator.stripe_account_id;
       if (!acct) {
         await bot.answerCallbackQuery(q.id, { text: "Stripe nicht verbunden. Bitte Setup prüfen." });
+        await bot.sendMessage(chatId, "⚠️ Stripe ist für diesen Creator noch nicht verbunden.");
         return;
       }
 
@@ -473,7 +673,9 @@ if (msg.chat.type === "group" || msg.chat.type === "supergroup") {
   // jede Message → Kontaktzeit
   bot.on("message", async (msg) => {
     if (!msg?.from) return;
-    await supabase.from("vip_users").update({ letzter_kontakt: nowTS() }).eq("telegram_id", String(msg.from.id));
+    try {
+      await supabase.from("vip_users").update({ letzter_kontakt: nowTS() }).eq("telegram_id", String(msg.from.id));
+    } catch {}
   });
 }
 
@@ -690,8 +892,10 @@ cron.schedule("0 8 * * *", async () => {
     .select("telegram_id, chat_id, vip_bis")
     .gte("vip_bis", today).lte("vip_bis", warnDate).eq("status", "aktiv");
   for (const u of warnUsers || []) {
-    await bot.sendMessage(Number(u.chat_id || u.telegram_id),
-      `⏰ Dein VIP läuft am ${u.vip_bis} ab. Verlängere rechtzeitig mit /start → „Jetzt bezahlen“.`);
+    try {
+      await bot.sendMessage(Number(u.chat_id || u.telegram_id),
+        `⏰ Dein VIP läuft am ${u.vip_bis} ab. Verlängere rechtzeitig mit /start → „Jetzt bezahlen“.`);
+    } catch {}
   }
 
   // Abgelaufen → kicken
@@ -705,18 +909,20 @@ cron.schedule("0 8 * * *", async () => {
     for (const u of expired) {
       const group = map.get(u.creator_id);
       if (!group) continue;
-      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`, {
-        method:"POST", headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id) })
-      });
-      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`, {
-        method:"POST", headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id), only_if_banned: true })
-      });
-      await supabase.from("vip_users").update({ status: "abgelaufen" })
-        .eq("creator_id", u.creator_id).eq("telegram_id", u.telegram_id);
-      await bot.sendMessage(Number(u.chat_id || u.telegram_id),
-        `❌ Dein VIP ist abgelaufen. Du wurdest aus der Gruppe entfernt. Mit /start → „Jetzt bezahlen“ kannst du jederzeit verlängern.`);
+      try {
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`, {
+          method:"POST", headers:{ "Content-Type":"application/json" },
+          body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id) })
+        });
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`, {
+          method:"POST", headers:{ "Content-Type":"application/json" },
+          body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id), only_if_banned: true })
+        });
+        await supabase.from("vip_users").update({ status: "abgelaufen" })
+          .eq("creator_id", u.creator_id).eq("telegram_id", u.telegram_id);
+        await bot.sendMessage(Number(u.chat_id || u.telegram_id),
+          `❌ Dein VIP ist abgelaufen. Du wurdest aus der Gruppe entfernt. Mit /start → „Jetzt bezahlen“ kannst du jederzeit verlängern.`);
+      } catch {}
     }
   }
   console.log("⏲️ daily cron done");
