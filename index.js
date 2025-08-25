@@ -1,4 +1,4 @@
-// index.js – Luxbot @ Render (Telegram + Stripe Connect + Supabase + Voice-Intro)
+// index.js – Luxbot @ Render (Telegram + Stripe Connect + Supabase + Voice-Intro + Flirty Welcome)
 import express from "express";
 import dotenv from "dotenv";
 import TelegramBot from "node-telegram-bot-api";
@@ -33,11 +33,11 @@ const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Helpers
+/** Helpers */
 // ──────────────────────────────────────────────────────────────────────────────
-const nowTS = () => new Date().toISOString().replace("T"," ").replace("Z","");
-const todayISO = () => new Date().toISOString().slice(0,10);
-const addDaysISO = (d) => new Date(Date.now()+d*864e5).toISOString().slice(0,10);
+const nowTS = () => new Date().toISOString().replace("T", " ").replace("Z", "");
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const addDaysISO = (d) => new Date(Date.now() + d * 864e5).toISOString().slice(0, 10);
 
 // Consent-Tracker (In-Memory) für Alterscheck & Regeln vor Zahlung
 // key = `${creator_id}:${telegram_id}` → { age: boolean, rules: boolean }
@@ -49,6 +49,33 @@ function getMW(userId) {
   const k = String(userId);
   if (!modelWizard.has(k)) modelWizard.set(k, { expectVoice: false, expectCaption: false });
   return modelWizard.get(k);
+}
+
+// 🔥 Flirty Welcome zusammenbauen aus welcome_text (+ ${first_name} optional) + Preis/Dauer + Confirm-Block
+function buildWelcomeMessage(creator, firstName = "") {
+  const price = Number(creator.preis || 0).toFixed(0);
+  const days = Number(creator.vip_days ?? creator.vip_dauer ?? 30);
+
+  const base =
+    (creator.welcome_text && creator.welcome_text.trim().length > 0)
+      ? creator.welcome_text.replace(/\$\{?first_name\}?/g, firstName).trim()
+      : (
+`👋 Hey ${firstName}… schön, dass du zu mir gefunden hast 😘
+
+Hier bekommst du meinen **privatesten VIP‑Zugang** – nur die heißesten Inhalte, die du sonst nirgends siehst 🔥`
+        .trim()
+      );
+
+  const meta = `\n\n💶 ${price} €  •  ⏳ ${days} Tage exklusiv`;
+
+  const confirm =
+`\n\nBevor ich dich reinlasse, brauch ich nur dein Go:
+1) 🔞 Du bist wirklich 18+
+2) 📜 Du akzeptierst meine Regeln
+
+Danach öffne ich dir meine VIP‑Welt… es wird **heiß** 😏`;
+
+  return `${base}${meta}${confirm}`;
 }
 
 // CreatorConfig per creator_id (inkl. Voice-Felder)
@@ -476,18 +503,8 @@ async function bootstrapTelegram() {
     const key = `${creator_id}:${msg.from.id}`;
     consentState.set(key, { age: false, rules: false });
 
-    const price = Number(creator.preis || 0).toFixed(0);
-    const days  = Number(creator.vip_days ?? creator.vip_dauer ?? 30);
-
-    const text = [
-      `👋 Willkommen, ${msg.from.first_name}!`,
-      `Preis: ${price} €`,
-      `Dauer: ${days} Tage`,
-      "",
-      "Bevor es losgeht, bitte bestätige:",
-      "1) 🔞 Du bist mind. 18 Jahre alt",
-      "2) 📜 Du hast die Regeln gelesen & akzeptierst sie"
-    ].join("\n");
+    // ✨ Flirty Welcome nutzen
+    const text = buildWelcomeMessage(creator, msg.from.first_name || "");
 
     const kb = {
       inline_keyboard: [
@@ -497,7 +514,7 @@ async function bootstrapTelegram() {
       ]
     };
 
-    await bot.sendMessage(msg.chat.id, text, { reply_markup: kb });
+    await bot.sendMessage(msg.chat.id, text, { reply_markup: kb, parse_mode: "Markdown" });
   });
 
   // Callback-Handler (inkl. Voice-Test/Caption)
@@ -763,7 +780,7 @@ app.get("/stripe/connect/refresh", (_, res) => res.send("🔄 Onboarding abgebro
 app.get("/stripe/connect/return",  (_, res) => res.send("✅ Onboarding abgeschlossen (oder fortgesetzt). Du kannst dieses Fenster schließen."));
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Stripe – Webhook (achte im Dashboard auf „Events on connected accounts“)
+/** Stripe – Webhook (achte im Dashboard auf „Events on connected accounts“) */
 // ──────────────────────────────────────────────────────────────────────────────
 app.post("/stripe/webhook", async (req, res) => {
   if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.sendStatus(200);
@@ -814,6 +831,7 @@ app.post("/stripe/webhook", async (req, res) => {
         { onConflict: "creator_id,telegram_id" }
       ).select("telegram_id, chat_id").maybeSingle();
 
+      // (optional) Nach Zahlung könntest du auch buildWelcomeMessage nutzen.
       if (cfg?.welcome_text) {
         await bot.sendMessage(Number(chat_id), cfg.welcome_text);
       }
@@ -905,17 +923,17 @@ cron.schedule("0 8 * * *", async () => {
 
   if (expired?.length) {
     const { data: cfgs } = await supabase.from("creator_config").select("creator_id, group_chat_id");
-    const map = new Map((cfgs||[]).map(c => [c.creator_id, c.group_chat_id]));
+    const map = new Map((cfgs || []).map(c => [c.creator_id, c.group_chat_id]));
     for (const u of expired) {
       const group = map.get(u.creator_id);
       if (!group) continue;
       try {
         await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`, {
-          method:"POST", headers:{ "Content-Type":"application/json" },
+          method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id) })
         });
         await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`, {
-          method:"POST", headers:{ "Content-Type":"application/json" },
+          method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id), only_if_banned: true })
         });
         await supabase.from("vip_users").update({ status: "abgelaufen" })
