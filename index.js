@@ -10,7 +10,8 @@ const {
   BOT_TOKEN,
   TELEGRAM_GROUP_ID,               // z.B. -1001234567890
   SUPABASE_URL,
-  SUPABASE_ANON_KEY,
+  SUPABASE_ANON_KEY,               // optional (Fallback)
+  SUPABASE_SERVICE_ROLE_KEY,       // bevorzugt (Server-only!)
   STRIPE_SECRET_KEY,
   STRIPE_WEBHOOK_SECRET,           // Stripe → Webhook endpoint secret
   RENDER_EXTERNAL_URL,
@@ -21,22 +22,22 @@ const {
 const TABLE = 'vip_users';
 const COL = {
   id: 'id',
-  telegram_id: 'telegram_id',                // (bei dir vorhanden, aber wir nutzen unten 'telegram_user_id' für Kick/DM)
-  telegram_user_id: 'telegram_user_id',      // <- die echte Telegram-ID (TEXT/NUM)
+  telegram_id: 'telegram_id',
+  telegram_user_id: 'telegram_user_id', // echte Telegram-ID
   username: 'username',
   creator_id: 'creator_id',
 
   alter_ok: 'alter_ok',
   regeln_ok: 'regeln_ok',
-  zahlung_ok: 'zahlung_ok',                  // BOOL – "zahlt aktiv/ok"
+  zahlung_ok: 'zahlung_ok',
 
-  vip_bis: 'vip_bis',                        // TIMESTAMP (UTC) – Ende der Mitgliedschaft
+  vip_bis: 'vip_bis',
   letzter_kontakt: 'letzter_kontakt',
-  status: 'status',                          // 'active' | 'inactive' | 'unpaid' etc.
+  status: 'status',
 
   screenshot_url: 'screenshot_url',
-  letzte_erinnerung: 'letzte_erinnerung',    // TEXT – '5d' | '1d' (welche Warnung zuletzt)
-  warned_at: 'warned_at',                    // TIMESTAMP – wann zuletzt gewarnt
+  letzte_erinnerung: 'letzte_erinnerung', // '5d' | '1d'
+  warned_at: 'warned_at',
 
   alter_verifiziert: 'alter_verifiziert',
   selfie_url: 'selfie_url',
@@ -51,24 +52,91 @@ const COL = {
   stripe_subscription_id: 'stripe_subscription_id',
   stripe_checkout_session_id: 'stripe_checkout_session_id',
 
-  renewal_mode: 'renewal_mode'               // optional: 'auto' | 'manual'
+  renewal_mode: 'renewal_mode'
 };
 
 // ---- Init ----
 const app = express();
 const bot = new Telegraf(BOT_TOKEN);
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2022-11-15' });
 
-// Telegraf/Express
+// ---- Supabase: nutze SERVICE_ROLE wenn vorhanden ----
+const SB_URL = SUPABASE_URL || process.env.PUBLIC_SUPABASE_URL;
+const SB_KEY = SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY || process.env.PUBLIC_SUPABASE_ANON_KEY;
+if (!SB_URL || !SB_KEY) {
+  console.error('❌ Missing Supabase ENV. Need SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY/ANON_KEY.');
+  process.exit(1);
+}
+const supabase = createClient(SB_URL, SB_KEY);
+
+// ---- Stripe ----
+const stripe = new Stripe(STRIPE_SECRET_KEY);
+
+// ⚠️ WICHTIG: Stripe-Webhook MUSS den RAW-Body bekommen – DARUM VOR bodyParser.json()!
+app.post('/webhook/stripe', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
+  let event;
+  try {
+    const sig = req.headers['stripe-signature'];
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Stripe signature error:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === 'invoice.payment_succeeded') {
+      const invoice = event.data.object;
+      const customerId = invoice.customer;
+      const { data, error } = await supabase
+        .from(TABLE)
+        .select('*')
+        .eq(COL.stripe_customer_id, String(customerId))
+        .maybeSingle();
+      if (!error && data) {
+        await extendMembership(data[COL.telegram_user_id], 30);
+      }
+    }
+
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const customerId = session.customer;
+      const telegramIdFromMeta = session?.metadata?.telegram_user_id;
+
+      if (telegramIdFromMeta) {
+        await extendMembership(telegramIdFromMeta, 30);
+        if (customerId) {
+          await supabase.from(TABLE)
+            .update({ [COL.stripe_customer_id]: String(customerId) })
+            .eq(COL.telegram_user_id, String(telegramIdFromMeta));
+        }
+      } else if (customerId) {
+        const { data, error } = await supabase
+          .from(TABLE)
+          .select('*')
+          .eq(COL.stripe_customer_id, String(customerId))
+          .maybeSingle();
+        if (!error && data) {
+          await extendMembership(data[COL.telegram_user_id], 30);
+        }
+      }
+    }
+
+    // Optional weitere Events (invoice.payment_failed, customer.subscription.*) hier behandeln
+
+    res.json({ received: true });
+  } catch (e) {
+    console.error('Stripe handler error', e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+// Ab hier erst JSON-Parser für alle anderen Routen aktivieren
 app.use(bodyParser.json());
 
 // ---- Helpers ----
 const nowUtc = () => new Date();
 const addDays = (d, n) => new Date(d.getTime() + n * 86400000);
 const startOfHour = (d) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours(), 0, 0));
-
-function toDate(x) { return x ? new Date(x) : null; }
+const toDate = (x) => (x ? new Date(x) : null);
 
 async function fetchByTelegramId(tid) {
   const { data, error } = await supabase
@@ -82,8 +150,7 @@ async function fetchByTelegramId(tid) {
 
 function isActive(record) {
   const until = toDate(record?.[COL.vip_bis]);
-  if (!until) return false;
-  return until.getTime() > nowUtc().getTime();
+  return !!(until && until.getTime() > nowUtc().getTime());
 }
 
 async function notifyUserDMorGroup(telegramId, text, extra = {}) {
@@ -138,7 +205,7 @@ async function kickFromGroup(telegramId) {
   if (!TELEGRAM_GROUP_ID) return false;
   try {
     await bot.telegram.banChatMember(TELEGRAM_GROUP_ID, Number(telegramId));
-    await bot.telegram.unbanChatMember(TELEGRAM_GROUP_ID, Number(telegramId)); // Rejoin später erlaubt
+    await bot.telegram.unbanChatMember(TELEGRAM_GROUP_ID, Number(telegramId)); // Rejoin erlauben
     return true;
   } catch (e) {
     console.error('Kick error', e);
@@ -149,18 +216,15 @@ async function kickFromGroup(telegramId) {
 async function handleExpiry(telegramId) {
   const u = await fetchByTelegramId(telegramId);
   if (!u) return;
-
-  // wenn schon aktiv → nichts tun
   if (isActive(u)) return;
 
-  // als inaktiv markieren & kicken
   await setMembership(telegramId, { active: false, paid: false });
   const kicked = await kickFromGroup(telegramId);
 
   await notifyUserDMorGroup(
     telegramId,
     `❌ Deine VIP‑Mitgliedschaft ist abgelaufen und wurde beendet${kicked ? ' (du wurdest aus der VIP‑Gruppe entfernt)' : ''}.\n` +
-    `👉 Zahle jederzeit wieder – danach bekommst du automatisch **+30 Tage**.`,
+    `👉 Zahle jederzeit wieder – danach bekommst du automatisch **+30 Tage**.`
   );
 }
 
@@ -213,7 +277,6 @@ async function runHourlyChecks() {
     if (until > in5dStart && until <= in5dEnd) {
       const lastType = u[COL.letzte_erinnerung];
       const lastAt = toDate(u[COL.warned_at]);
-      // Warnung pro "Fenster" nur einmal
       if (lastType !== '5d' || !lastAt || lastAt < startOfHour(in5dStart)) {
         await notifyUserDMorGroup(
           tid,
@@ -252,64 +315,6 @@ async function runHourlyChecks() {
 // stündlich
 setInterval(runHourlyChecks, 60 * 60 * 1000);
 runHourlyChecks().catch(console.error);
-
-// ---- Stripe Webhook: Zahlung → +30 Tage
-app.post('/webhook/stripe', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
-  let event;
-  try {
-    const sig = req.headers['stripe-signature'];
-    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error('Stripe signature error:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  try {
-    if (event.type === 'invoice.payment_succeeded') {
-      const invoice = event.data.object;
-      const customerId = invoice.customer;
-      // primär: per stripe_customer_id matchen
-      const { data, error } = await supabase
-        .from(TABLE)
-        .select('*')
-        .eq(COL.stripe_customer_id, String(customerId))
-        .maybeSingle();
-      if (!error && data) {
-        await extendMembership(data[COL.telegram_user_id], 30);
-      }
-    }
-
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object;
-      const customerId = session.customer;
-      const telegramIdFromMeta = session?.metadata?.telegram_user_id;
-
-      if (telegramIdFromMeta) {
-        await extendMembership(telegramIdFromMeta, 30);
-        // optional: stripe_customer_id speichern
-        if (customerId) {
-          await supabase.from(TABLE)
-            .update({ [COL.stripe_customer_id]: String(customerId) })
-            .eq(COL.telegram_user_id, String(telegramIdFromMeta));
-        }
-      } else if (customerId) {
-        const { data, error } = await supabase
-          .from(TABLE)
-          .select('*')
-          .eq(COL.stripe_customer_id, String(customerId))
-          .maybeSingle();
-        if (!error && data) {
-          await extendMembership(data[COL.telegram_user_id], 30);
-        }
-      }
-    }
-
-    res.json({ received: true });
-  } catch (e) {
-    console.error('Stripe handler error', e);
-    res.status(500).json({ ok: false });
-  }
-});
 
 // ---- Telegram Webhook ----
 app.post(`/webhook/telegram/${BOT_TOKEN}`, (req, res) => {
