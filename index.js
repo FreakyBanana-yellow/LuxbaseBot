@@ -41,9 +41,11 @@ if (!SUPABASE_SERVICE_ROLE_KEY) {
 const supabaseAdmin = createClient(SB_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false }
 });
-const supabaseAnon = createClient(SB_URL, SUPABASE_ANON_KEY || process.env.PUBLIC_SUPABASE_ANON_KEY || "", {
-  auth: { persistSession: false }
-});
+const supabaseAnon = createClient(
+  SB_URL,
+  SUPABASE_ANON_KEY || process.env.PUBLIC_SUPABASE_ANON_KEY || "",
+  { auth: { persistSession: false } }
+);
 
 /* ────────────────────────────────────────────────────────────────────────────
    Helpers
@@ -130,6 +132,58 @@ async function sbSelect(table, select, match, single = false) {
 
 async function getCreatorCfgById(creator_id) {
   return await sbSelect("creator_config", "*", { creator_id }, true);
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+   Invite-Checks: Nur Einmallink-Beitritte erlauben
+   ──────────────────────────────────────────────────────────────────────────── */
+async function findValidInvite({ creator_id, group_chat_id, telegram_id, invite_url }) {
+  // 1) exakte URL prüfen
+  let row = null;
+  if (invite_url) {
+    row = await sbSelect(
+      "invite_links",
+      "*",
+      {
+        creator_id: String(creator_id),
+        group_chat_id: String(group_chat_id),
+        invite_link: String(invite_url),
+        used: false
+      },
+      true
+    ).catch(() => null);
+  }
+  // 2) Fallback: usergebundener Link
+  if (!row) {
+    row = await sbSelect(
+      "invite_links",
+      "*",
+      {
+        creator_id: String(creator_id),
+        group_chat_id: String(group_chat_id),
+        telegram_id: String(telegram_id),
+        used: false
+      },
+      true
+    ).catch(() => null);
+  }
+  if (!row) return null;
+
+  // Falls Link an einen spezifischen User gebunden ist → muss passen
+  if (row.telegram_id && String(row.telegram_id) !== String(telegram_id)) return null;
+
+  // Ablauf prüfen
+  if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) return null;
+
+  return row;
+}
+
+async function markInviteUsed({ id, used_by }) {
+  await sbAdminUpdate(
+    "invite_links",
+    { used: true, used_at: nowTS(), used_by: String(used_by) },
+    { id }
+  );
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -386,7 +440,7 @@ async function bootstrapTelegram() {
       const chatId = q.message?.chat?.id;
       const userId = String(q.from?.id);
 
-    const me = await sbSelect("vip_users", "creator_id", {
+      const me = await sbSelect("vip_users", "creator_id", {
         telegram_id: userId,
         chat_id: String(chatId)
       }, true);
@@ -422,7 +476,7 @@ async function bootstrapTelegram() {
     }
   });
 
-  // Aktivitäts-Updates
+  // Aktivitäts-Updates bei Voice/Audio/Video-Note
   for (const ev of ["voice", "audio", "video_note"]) {
     bot.on(ev, async (msg) => {
       const uid = msg.from?.id ? String(msg.from.id) : null;
@@ -441,7 +495,7 @@ async function bootstrapTelegram() {
     });
   }
 
-  // 🔔 NEU: Beitrittsanfragen (Gruppen mit „Join Request“)
+  // 🔒 NEU: Beitrittsanfragen (Gruppen mit „Join Request“) → nur mit gültigem Einmallink
   bot.on("chat_join_request", async (req) => {
     try {
       const groupId = String(req.chat.id);
@@ -451,6 +505,14 @@ async function bootstrapTelegram() {
       const creator_id = cfg?.creator_id || null;
       if (!creator_id) return;
 
+      const inviteUrl = req?.invite_link?.invite_link || req?.invite_link?.url || null;
+      const valid = await findValidInvite({ creator_id, group_chat_id: groupId, telegram_id, invite_url: inviteUrl });
+
+      if (!valid) {
+        await bot.declineChatJoinRequest(Number(groupId), Number(telegram_id)).catch(() => {});
+        return;
+      }
+
       await sbAdminUpsert("vip_users", {
         creator_id,
         telegram_id,
@@ -460,15 +522,15 @@ async function bootstrapTelegram() {
         zahlung_ok: false
       }, { onConflict: "creator_id,telegram_id" });
 
+      await markInviteUsed({ id: valid.id, used_by: telegram_id });
       await bot.approveChatJoinRequest(Number(groupId), Number(telegram_id)).catch(() => {});
-      await handleExpiry({ creator_id, telegram_id, group_chat_id: groupId });
-      console.log("✅ join_request handled for", telegram_id, "in", groupId);
+      console.log("✅ join_request approved via single-use link:", telegram_id, "->", groupId);
     } catch (e) {
       console.error("chat_join_request error:", e.message);
     }
   });
 
-  // Direktes Join-Event (klassisch)
+  // 🔒 Direkter Join (klassisch) → nur mit gültigem Einmallink, sonst Kick
   bot.on("message", async (msg) => {
     if (!msg?.new_chat_members?.length) return;
 
@@ -477,9 +539,19 @@ async function bootstrapTelegram() {
     const creator_id = cfg?.creator_id || null;
     if (!creator_id) return;
 
+    // Telegram liefert bei Join via Link u.U. message.invite_link (ChatInviteLink)
+    const inviteUrl = msg?.invite_link?.invite_link || msg?.invite_link?.url || null;
+
     for (const m of msg.new_chat_members) {
       if (m.is_bot) continue;
       const telegram_id = String(m.id);
+
+      const valid = await findValidInvite({ creator_id, group_chat_id: groupId, telegram_id, invite_url: inviteUrl });
+
+      if (!valid) {
+        await kickFromGroup({ group_chat_id: groupId, telegram_id });
+        continue;
+      }
 
       await sbAdminUpsert("vip_users", {
         creator_id,
@@ -490,13 +562,13 @@ async function bootstrapTelegram() {
         zahlung_ok: false
       }, { onConflict: "creator_id,telegram_id" });
 
+      await markInviteUsed({ id: valid.id, used_by: telegram_id });
+
       const u = await sbSelect("vip_users", "vip_bis, zahlung_ok", { creator_id, telegram_id }, true);
       if (!u || !isActive(u)) {
         await bot.sendMessage(Number(groupId),
-          `Hi ${m.first_name || ""}! Ich finde keine aktive VIP-Mitgliedschaft.\n` +
-          `Bitte schließe die Zahlung ab – sonst muss ich dich entfernen.`
+          `Hi ${m.first_name || ""}! Zahlung prüfen – danach schalte ich dich frei.`
         );
-        await handleExpiry({ creator_id, telegram_id, group_chat_id: groupId });
       }
     }
   });
