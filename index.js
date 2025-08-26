@@ -14,7 +14,6 @@ const {
   BASE_URL, // z.B. https://dein-service.onrender.com
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
-  SUPABASE_ANON_KEY,
   STRIPE_SECRET_KEY,
   STRIPE_WEBHOOK_SECRET,
   PORT = 3000
@@ -25,7 +24,7 @@ if (!BOT_TOKEN || !BASE_URL) {
   process.exit(1);
 }
 
-const SB_URL = SUPABASE_URL || process.env.PUBLIC_SUPABASE_URL;
+const SB_URL = SUPABASE_URL;
 if (!SB_URL) {
   console.error("❌ SUPABASE_URL fehlt.");
   process.exit(1);
@@ -35,17 +34,19 @@ if (!SUPABASE_SERVICE_ROLE_KEY) {
   process.exit(1);
 }
 
+console.log("ENV CHECK:", {
+  has_SUPABASE_URL: !!SB_URL,
+  has_SERVICE_ROLE: !!SUPABASE_SERVICE_ROLE_KEY,
+  has_BOT_TOKEN: !!BOT_TOKEN,
+  has_BASE_URL: !!BASE_URL
+});
+
 /* ────────────────────────────────────────────────────────────────────────────
-   Supabase: 2 Clients (Admin für Writes, Anon optional für Reads)
+   Supabase: Nur Admin-Client (Service Role)
    ──────────────────────────────────────────────────────────────────────────── */
 const supabaseAdmin = createClient(SB_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false }
 });
-const supabaseAnon = createClient(
-  SB_URL,
-  SUPABASE_ANON_KEY || process.env.PUBLIC_SUPABASE_ANON_KEY || "",
-  { auth: { persistSession: false } }
-);
 
 /* ────────────────────────────────────────────────────────────────────────────
    Helpers
@@ -169,10 +170,7 @@ async function findValidInvite({ creator_id, group_chat_id, telegram_id, invite_
   }
   if (!row) return null;
 
-  // Falls Link an einen spezifischen User gebunden ist → muss passen
   if (row.telegram_id && String(row.telegram_id) !== String(telegram_id)) return null;
-
-  // Ablauf prüfen
   if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) return null;
 
   return row;
