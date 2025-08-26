@@ -386,8 +386,7 @@ async function bootstrapTelegram() {
       const chatId = q.message?.chat?.id;
       const userId = String(q.from?.id);
 
-      // Creator aus DB (Datensatz existiert nun sicher)
-      const me = await sbSelect("vip_users", "creator_id", {
+    const me = await sbSelect("vip_users", "creator_id", {
         telegram_id: userId,
         chat_id: String(chatId)
       }, true);
@@ -423,7 +422,7 @@ async function bootstrapTelegram() {
     }
   });
 
-  // Aktivitäts-Updates bei Voice/Audio/Video-Note
+  // Aktivitäts-Updates
   for (const ev of ["voice", "audio", "video_note"]) {
     bot.on(ev, async (msg) => {
       const uid = msg.from?.id ? String(msg.from.id) : null;
@@ -442,7 +441,34 @@ async function bootstrapTelegram() {
     });
   }
 
-  // Sofort-Enforcement bei Gruppenbeitritt + (neu) Datensatz anlegen, falls fehlend
+  // 🔔 NEU: Beitrittsanfragen (Gruppen mit „Join Request“)
+  bot.on("chat_join_request", async (req) => {
+    try {
+      const groupId = String(req.chat.id);
+      const telegram_id = String(req.from.id);
+
+      const cfg = await sbSelect("creator_config", "creator_id", { group_chat_id: groupId }, true);
+      const creator_id = cfg?.creator_id || null;
+      if (!creator_id) return;
+
+      await sbAdminUpsert("vip_users", {
+        creator_id,
+        telegram_id,
+        chat_id: groupId,
+        letzter_kontakt: nowTS(),
+        status: "inactive",
+        zahlung_ok: false
+      }, { onConflict: "creator_id,telegram_id" });
+
+      await bot.approveChatJoinRequest(Number(groupId), Number(telegram_id)).catch(() => {});
+      await handleExpiry({ creator_id, telegram_id, group_chat_id: groupId });
+      console.log("✅ join_request handled for", telegram_id, "in", groupId);
+    } catch (e) {
+      console.error("chat_join_request error:", e.message);
+    }
+  });
+
+  // Direktes Join-Event (klassisch)
   bot.on("message", async (msg) => {
     if (!msg?.new_chat_members?.length) return;
 
@@ -455,7 +481,6 @@ async function bootstrapTelegram() {
       if (m.is_bot) continue;
       const telegram_id = String(m.id);
 
-      // Datensatz (inactive) sicherstellen
       await sbAdminUpsert("vip_users", {
         creator_id,
         telegram_id,
@@ -484,19 +509,19 @@ bootstrapTelegram().catch(console.error);
    ──────────────────────────────────────────────────────────────────────────── */
 async function runVipChecks() {
   try {
+    // 1) Alle vip_users holen (ohne Join → keine Typkonflikte)
     const { data: rows, error } = await supabaseAdmin
       .from("vip_users")
-      .select(`
-        creator_id,
-        telegram_id,
-        vip_bis,
-        zahlung_ok,
-        letzte_erinnerung,
-        warned_at,
-        chat_id,
-        creator_config:creator_id ( group_chat_id )
-      `);
+      .select("creator_id, telegram_id, vip_bis, zahlung_ok, letzte_erinnerung, warned_at, chat_id, status");
     if (error) throw error;
+
+    // 2) creator_config separat holen und in Map legen
+    const { data: cfgs, error: cfgErr } = await supabaseAdmin
+      .from("creator_config")
+      .select("creator_id, group_chat_id");
+    if (cfgErr) throw cfgErr;
+
+    const cfgMap = new Map((cfgs || []).map(c => [String(c.creator_id), String(c.group_chat_id || "")]));
 
     const now = new Date();
     const in5dStart = new Date(now.getTime() + 5 * 864e5);
@@ -505,8 +530,9 @@ async function runVipChecks() {
     const in1dEnd   = new Date(now.getTime() + (1 + 1/24) * 864e5);
 
     for (const u of rows || []) {
-      const { creator_id, telegram_id } = u;
-      const group_chat_id = u?.creator_config?.group_chat_id || null;
+      const creator_id = u.creator_id;
+      const telegram_id = u.telegram_id;
+      const group_chat_id = cfgMap.get(String(creator_id)) || null;
 
       if (!u.vip_bis) {
         if (u.zahlung_ok === false || u.status === "inactive") {
