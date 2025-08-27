@@ -1057,21 +1057,28 @@ app.post("/stripe/webhook", async (req, res) => {
   res.json({ received: true });
 });
 
-// statt: "0 8 * * *"   (jeden Tag 08:00)
-// neu:
-cron.schedule("* * * * *", async () => {
-  console.log("⏱️ Test-Cron läuft minütlich");
-  // dein Ablauf-Check
-})
+// ──────────────────────────────────────────────────────────────────────────────
+// Daily/Minutely Check – Reminder & Kick
+// ──────────────────────────────────────────────────────────────────────────────
 
-  // Warnen
+// Stelle für Tests minütlich; für Produktion lieber "0 8 * * *"
+const CRON_EXPR = process.env.CRON_EXPR || "* * * * *";
+
+async function runExpirySweep() {
+  const today = todayISO();
+  const warnDate = addDaysISO(5);
+
+  // Warnen (läuft in <= 5 Tagen ab)
   const { data: warnUsers } = await supabase.from("vip_users")
     .select("telegram_id, chat_id, vip_bis")
     .gte("vip_bis", today).lte("vip_bis", warnDate).eq("status", "aktiv");
+
   for (const u of warnUsers || []) {
     try {
-      await bot.sendMessage(Number(u.chat_id || u.telegram_id),
-        `⏰ Dein VIP läuft am ${u.vip_bis} ab. Verlängere rechtzeitig mit /start → „Jetzt bezahlen“.`);
+      await bot.sendMessage(
+        Number(u.chat_id || u.telegram_id),
+        `⏰ Dein VIP läuft am ${u.vip_bis} ab. Verlängere rechtzeitig mit /start → „Jetzt bezahlen“.`
+      );
     } catch {}
   }
 
@@ -1088,30 +1095,45 @@ cron.schedule("* * * * *", async () => {
       if (!group) continue;
       try {
         await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id) })
         });
         await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id), only_if_banned: true })
         });
-        await supabase.from("vip_users").update({ status: "abgelaufen" })
-          .eq("creator_id", u.creator_id).eq("telegram_id", u.telegram_id);
-        await bot.sendMessage(Number(u.chat_id || u.telegram_id),
-          `❌ Dein VIP ist abgelaufen. Du wurdest aus der Gruppe entfernt. Mit /start → „Jetzt bezahlen“ kannst du jederzeit verlängern.`);
+
+        await supabase.from("vip_users")
+          .update({ status: "abgelaufen" })
+          .eq("creator_id", u.creator_id)
+          .eq("telegram_id", u.telegram_id);
+
+        await bot.sendMessage(
+          Number(u.chat_id || u.telegram_id),
+          `❌ Dein VIP ist abgelaufen. Du wurdest aus der Gruppe entfernt. Mit /start → „Jetzt bezahlen“ kannst du jederzeit verlängern.`
+        );
       } catch {}
     }
   }
-  console.log("⏲️ daily cron done");
+}
+
+cron.schedule(CRON_EXPR, async () => {
+  try {
+    await runExpirySweep();
+    console.log("⏲️ expiry sweep done");
+  } catch (e) {
+    console.error("expiry sweep error:", e?.message || e);
+  }
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Health
 // ──────────────────────────────────────────────────────────────────────────────
 app.get("/", (_, res) => res.send("Luxbot up"));
-app.get("/stripe/success", (_, res) => res.send("✅ Zahlung erfolgreich. Der Bot sendet dir gleich den Zugang in Telegram."));
-app.get("/stripe/cancel",  (_, res) => res.send("❌ Zahlung abgebrochen."));
-
+app.get("/stripe/success",    (_, res) => res.send("✅ Zahlung erfolgreich. Der Bot sendet dir gleich den Zugang in Telegram."));
+app.get("/stripe/cancel",     (_, res) => res.send("❌ Zahlung abgebrochen."));
 app.get("/health/db", async (_, res) => {
   try {
     const { error } = await supabase.from("health_probe").insert({ ts: new Date().toISOString() }).select("*").maybeSingle();
@@ -1119,6 +1141,18 @@ app.get("/health/db", async (_, res) => {
     return res.json({ ok: true });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DEV ONLY: Manuell den Ablauf-Check triggern (zum Testen)
+// ──────────────────────────────────────────────────────────────────────────────
+app.post("/admin/run-expiry", async (_req, res) => {
+  try {
+    await runExpirySweep();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
