@@ -1,4 +1,4 @@
-// index.js – Luxbot @ Render (Telegram + Stripe Connect + Supabase + Voice-Intro + Flirty Welcome)
+// index.js – Luxbot @ Render (Telegram + Stripe Connect + Supabase + Voice-Intro + Flirty Welcome + Robust VIP Persistenz)
 import express from "express";
 import dotenv from "dotenv";
 import TelegramBot from "node-telegram-bot-api";
@@ -23,6 +23,8 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 const STRIPE_ACCOUNT_COUNTRY = process.env.STRIPE_ACCOUNT_COUNTRY || ""; // optional
+// ✅ NEU: Admin-ID für stille Alerts
+const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID ? String(process.env.ADMIN_TELEGRAM_ID) : null;
 
 if (!BOT_TOKEN || !BASE_URL || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("❌ ENV fehlt. Setze: BOT_TOKEN, BASE_URL, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY");
@@ -32,8 +34,6 @@ if (!BOT_TOKEN || !BASE_URL || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" }) : null;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 const nowTS = () => new Date().toISOString().replace("T", " ").replace("Z", "");
 const todayISO = () => new Date().toISOString().slice(0, 10);
@@ -67,7 +67,7 @@ function buildWelcomeMessage(creator, firstName = "") {
       : (
 `👋 Hey ${firstName}… schön, dass du zu mir gefunden hast 😘
 
-Hier bekommst du meinen **privatesten VIP‑Zugang** – nur die heißesten Inhalte, die du sonst nirgends siehst 🔥`
+Hier bekommst du meinen **privatesten VIP-Zugang** – nur die heißesten Inhalte, die du sonst nirgends siehst 🔥`
         .trim()
       );
 
@@ -79,9 +79,8 @@ Hier bekommst du meinen **privatesten VIP‑Zugang** – nur die heißesten Inha
 1) 🔞 Du bist wirklich 18+
 2) 📜 Du akzeptierst meine Regeln
 
-Danach öffne ich dir meine VIP‑Welt… es wird **heiß** 😏`;
+Danach öffne ich dir meine VIP-Welt… es wird **heiß** 😏`;
 
-  // MDV2 escapen (auch die ** im Default werden escaped, das ist ok – wir wollen robusten Plain-Text)
   const text = escapeMDV2(baseRaw) + escapeMDV2(metaRaw) + escapeMDV2(confirmRaw);
   return text;
 }
@@ -157,6 +156,99 @@ async function saveCreatorVoiceCaption(telegramId, caption) {
   return !error;
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// ✅ NEU: Robuste VIP-Persistenz (Retries, Dead-Letter, Admin-Alert)
+// ──────────────────────────────────────────────────────────────────────────────
+
+const wait = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Dead-Letter-Logging
+async function logVipUserError(payload = {}, err = {}) {
+  try {
+    await supabase.from("vip_users_errors").insert({
+      payload_json: JSON.stringify(payload),
+      error_msg: err?.message || String(err),
+      created_at: new Date().toISOString()
+    });
+  } catch (e) {
+    console.error("vip_users_errors insert failed:", e?.message || e);
+  }
+}
+
+// Admin-Alert (optional)
+async function notifyAdmin(text) {
+  try {
+    if (ADMIN_TELEGRAM_ID) {
+      await bot.sendMessage(Number(ADMIN_TELEGRAM_ID), `⚠️ VIP-Persistenz: ${text}`);
+    }
+  } catch (e) {
+    console.error("notifyAdmin failed:", e?.message || e);
+  }
+}
+
+/**
+ * Sicherer VIP-Upsert mit Retries & Dead-Letter
+ * Erwartet mindestens creator_id & telegram_id
+ */
+async function ensureVipUserRow({
+  creator_id,
+  telegram_id,
+  chat_id = null,
+  status = null,            // "gestartet" | "aktiv" | "abgelaufen" | "gekündigt"
+  vip_bis = null,           // "YYYY-MM-DD"
+  username = null,
+  letztes_event = null,     // optional: z.B. "checkout.session.completed"
+  extra = {}                // optional: wird (falls vorhanden) in extras_json gespeichert
+}) {
+  if (!creator_id || !telegram_id) {
+    throw new Error("ensureVipUserRow: creator_id und telegram_id sind erforderlich");
+  }
+
+  const payload = {
+    creator_id,
+    telegram_id: String(telegram_id),
+    ...(chat_id ? { chat_id: String(chat_id) } : {}),
+    ...(status ? { status } : {}),
+    ...(vip_bis ? { vip_bis } : {}),
+    ...(username ? { username } : {}),
+    ...(letztes_event ? { letztes_event } : {}),
+    letzter_kontakt: nowTS()
+  };
+
+  if (extra && Object.keys(extra).length) payload.extras_json = extra;
+
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const { data, error } = await supabase
+        .from("vip_users")
+        .upsert(payload, { onConflict: "creator_id,telegram_id" })
+        .select("creator_id, telegram_id, chat_id, status, vip_bis")
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data) throw new Error("Upsert returned no data");
+      return { ok: true, data, attempt };
+    } catch (e) {
+      lastErr = e;
+      console.error(`ensureVipUserRow attempt ${attempt} failed:`, e?.message || e);
+      if (attempt < 3) {
+        await wait(300 * attempt); // 300ms, 600ms
+        continue;
+      }
+      await logVipUserError({ scope: "ensureVipUserRow", payload }, e);
+      await notifyAdmin(`DB-Schreiben fehlgeschlagen nach 3 Versuchen (creator_id=${creator_id}, telegram_id=${telegram_id}).`);
+      return { ok: false, error: lastErr };
+    }
+  }
+}
+
+async function setVipStatus({ creator_id, telegram_id, chat_id = null, status, vip_bis = null, username = null, letztes_event = null, extra = {} }) {
+  return ensureVipUserRow({ creator_id, telegram_id, chat_id, status, vip_bis, username, letztes_event, extra });
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+
 async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or_user_id }) {
   if (!group_chat_id) {
     console.error("sendDynamicInvite: group_chat_id fehlt");
@@ -183,7 +275,6 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
     const invite_link = resp.result.invite_link;
     const expires_at = new Date(expire * 1000).toISOString();
 
-    // optionales Logging (falls Tabelle existiert)
     try {
       await supabase.from("invite_links").insert({
         creator_id,
@@ -199,7 +290,7 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
       // nicht kritisch
     }
 
-    await bot.sendMessage(Number(chat_id_or_user_id), `🎟️ Dein VIP‑Zugang (15 Min gültig): ${invite_link}`);
+    await bot.sendMessage(Number(chat_id_or_user_id), `🎟️ Dein VIP-Zugang (15 Min gültig): ${invite_link}`);
     return { ok: true, invite_link, expires_at };
   } catch (e) {
     console.error("sendDynamicInvite error:", e.message);
@@ -208,7 +299,7 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Middleware (Stripe‑Webhook braucht RAW)
+// Middleware (Stripe-Webhook braucht RAW)
 // ──────────────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   if (req.originalUrl.startsWith("/stripe/webhook")) {
@@ -243,7 +334,7 @@ async function bootstrapTelegram() {
     console.error("❌ bootstrapTelegram error:", err.message);
   }
 
-  // Auto‑Bind beim Hinzufügen in Gruppe
+  // Auto-Bind beim Hinzufügen in Gruppe
   bot.on("my_chat_member", async (upd) => {
     const chat = upd.chat;
     const me = upd.new_chat_member;
@@ -271,7 +362,7 @@ async function bootstrapTelegram() {
         .update({ group_chat_id: String(chat.id) })
         .eq("creator_id", matches[0].creator_id);
 
-      await bot.sendMessage(chat.id, "✅ Gruppe verknüpft. Bitte gib mir Admin‑Rechte für Einladungen & Kicks.");
+      await bot.sendMessage(chat.id, "✅ Gruppe verknüpft. Bitte gib mir Admin-Rechte für Einladungen & Kicks.");
     } catch (e) {
       console.error("my_chat_member auto-bind error:", e?.message || e);
     }
@@ -293,8 +384,8 @@ async function bootstrapTelegram() {
 
     await bot.sendMessage(
       msg.chat.id,
-      "🎙️ Willst du jetzt eine Begrüßungs‑Sprachnachricht aufnehmen?\n" +
-      "• Bitte nutze den **runden Voice‑Button**.\n• Länge: **5–20 Sekunden**.",
+      "🎙️ Willst du jetzt eine Begrüßungs-Sprachnachricht aufnehmen?\n" +
+      "• Bitte nutze den **runden Voice-Button**.\n• Länge: **5–20 Sekunden**.",
       {
         reply_markup: {
           keyboard: [[{ text: "Aufnehmen" }], [{ text: "Abbrechen" }]],
@@ -389,14 +480,14 @@ async function bootstrapTelegram() {
     // Admin: /start link_creator_<uuid>
     const adminLink = /^link_creator_([A-Za-z0-9-]+)$/i.exec(raw);
 
-    // In Gruppe: Payload bevorzugt, sonst Auto‑Bind über Admin‑Match
+    // In Gruppe: Payload bevorzugt, sonst Auto-Bind über Admin-Match
     if (msg.chat.type === "group" || msg.chat.type === "supergroup") {
       try {
         if (creator_id) {
           await supabase.from("creator_config")
             .update({ group_chat_id: String(msg.chat.id) })
             .eq("creator_id", creator_id);
-          await bot.sendMessage(msg.chat.id, "✅ Gruppe verbunden! Bitte Admin‑Rechte geben.");
+          await bot.sendMessage(msg.chat.id, "✅ Gruppe verbunden! Bitte Admin-Rechte geben.");
           return;
         }
 
@@ -417,7 +508,7 @@ async function bootstrapTelegram() {
           .in("telegram_id", adminIds);
 
         if (error) {
-          await bot.sendMessage(msg.chat.id, "⚠️ DB‑Fehler beim Verknüpfen. Bitte später erneut versuchen.");
+          await bot.sendMessage(msg.chat.id, "⚠️ DB-Fehler beim Verknüpfen. Bitte später erneut versuchen.");
           return;
         }
 
@@ -433,7 +524,7 @@ async function bootstrapTelegram() {
         if (matches.length > 1) {
           await bot.sendMessage(
             msg.chat.id,
-            "⚠️ Mehrere Creator‑Admins erkannt. Bitte nur den gewünschten Creator‑Admin in dieser Gruppe belassen oder zunächst nur einen Creator verknüpfen."
+            "⚠️ Mehrere Creator-Admins erkannt. Bitte nur den gewünschten Creator-Admin in dieser Gruppe belassen oder zunächst nur einen Creator verknüpfen."
           );
           return;
         }
@@ -445,7 +536,7 @@ async function bootstrapTelegram() {
 
         await bot.sendMessage(
           msg.chat.id,
-          "✅ Gruppe automatisch verknüpft.\nBitte stelle sicher, dass ich Admin‑Rechte habe (Einladen & Kicken)."
+          "✅ Gruppe automatisch verknüpft.\nBitte stelle sicher, dass ich Admin-Rechte habe (Einladen & Kicken)."
         );
       } catch (e) {
         console.error("group /start autobind error:", e?.message || e);
@@ -454,7 +545,7 @@ async function bootstrapTelegram() {
       return;
     }
 
-    // ADMIN‑Flow (DM): Owner ↔ Creator koppeln
+    // ADMIN-Flow (DM): Owner ↔ Creator koppeln
     if (adminLink && msg.chat.type === "private") {
       const cId = adminLink[1];
       await supabase.from("creator_config").update({
@@ -464,22 +555,22 @@ async function bootstrapTelegram() {
 
       await bot.sendMessage(
         msg.chat.id,
-        "✅ Dein Telegram wurde mit deinem Luxbase‑Account verknüpft.\n" +
-        "Füge mich jetzt als Admin in deiner VIP‑Gruppe hinzu – ich verknüpfe sie automatisch.\n\n" +
-        "Tipp: Du kannst jetzt /setup_voice senden und eine Begrüßungs‑Sprachnachricht aufnehmen. 🎙️"
+        "✅ Dein Telegram wurde mit deinem Luxbase-Account verknüpft.\n" +
+        "Füge mich jetzt als Admin in deiner VIP-Gruppe hinzu – ich verknüpfe sie automatisch.\n\n" +
+        "Tipp: Du kannst jetzt /setup_voice senden und eine Begrüßungs-Sprachnachricht aufnehmen. 🎙️"
       );
       return;
     }
 
-    // Käufer‑Flow (DM)
+    // Käufer-Flow (DM)
     if (!creator_id) {
       await bot.sendMessage(msg.chat.id,
-        "❌ Ungültiger Start‑Link.\nÖffne den Link direkt aus den VIP‑Einstellungen (er enthält eine Kennung).");
+        "❌ Ungültiger Start-Link.\nÖffne den Link direkt aus den VIP-Einstellungen (er enthält eine Kennung).");
       return;
     }
 
     const creator = await getCreatorCfgById(creator_id);
-    if (!creator) { await bot.sendMessage(msg.chat.id, "❌ Creator‑Konfiguration nicht gefunden."); return; }
+    if (!creator) { await bot.sendMessage(msg.chat.id, "❌ Creator-Konfiguration nicht gefunden."); return; }
 
     // Voice-Intro (falls vorhanden) direkt vorspielen
     if (creator?.voice_enabled && creator?.voice_file_id && msg.chat.type === "private") {
@@ -493,15 +584,16 @@ async function bootstrapTelegram() {
       }
     }
 
-    // Käufer registrieren/aktualisieren
-    await supabase.from("vip_users").upsert({
+    // ✅ NEU: Käufer robust registrieren/aktualisieren (statt einfachem upsert)
+    await setVipStatus({
       creator_id,
       telegram_id: String(msg.from.id),
       chat_id: String(msg.chat.id),
-      username: msg.from.username || null,
       status: "gestartet",
-      letzter_kontakt: nowTS()
-    }, { onConflict: "creator_id,telegram_id" });
+      username: msg.from.username || null,
+      letztes_event: "start_clicked",
+      extra: { source: "telegram_start", chat_type: msg.chat.type }
+    });
 
     // Consent-State initialisieren
     const key = `${creator_id}:${msg.from.id}`;
@@ -573,7 +665,7 @@ async function bootstrapTelegram() {
     if (data.startsWith("show_rules:")) {
       const creator_id = data.split(":")[1];
       const creator = await getCreatorCfgById(creator_id);
-      const rules = creator?.regeln_text || "Standard‑Regeln: Kein Spam, kein Teilen von privaten Inhalten, respektvoll bleiben.";
+      const rules = creator?.regeln_text || "Standard-Regeln: Kein Spam, kein Teilen von privaten Inhalten, respektvoll bleiben.";
       await bot.answerCallbackQuery(q.id);
       await bot.sendMessage(chatId, escapeMDV2(`📜 Regeln:\n\n${rules}`), { parse_mode: "MarkdownV2" });
       return;
@@ -603,7 +695,7 @@ async function bootstrapTelegram() {
       }
 
       if (!creatorForPay) {
-        await bot.answerCallbackQuery(q.id, { text: "Bitte zuerst /start über den VIP‑Link nutzen." });
+        await bot.answerCallbackQuery(q.id, { text: "Bitte zuerst /start über den VIP-Link nutzen." });
         return;
       }
 
@@ -637,7 +729,7 @@ async function bootstrapTelegram() {
             unit_amount: amountCents,
             recurring: { interval: "day", interval_count: vipDays },
             product_data: {
-              name: `VIP‑Bot Zugang – ${creatorForPay.slice(0,8)}`,
+              name: `VIP-Bot Zugang – ${creatorForPay.slice(0,8)}`,
               metadata: { creator_id: creatorForPay }
             }
           }
@@ -680,8 +772,8 @@ async function bootstrapTelegram() {
             refresh_url: `${BASE_URL}/stripe/connect/refresh?creator_id=${encodeURIComponent(creatorForPay)}`,
             return_url:  `${BASE_URL}/stripe/connect/return?creator_id=${encodeURIComponent(creatorForPay)}`
           });
-          await bot.answerCallbackQuery(q.id, { text: "Stripe‑Onboarding unvollständig. Bitte abschließen." });
-          await bot.sendMessage(chatId, `⚠️ Bitte schließe dein Stripe‑Onboarding ab:\n${link.url}`);
+          await bot.answerCallbackQuery(q.id, { text: "Stripe-Onboarding unvollständig. Bitte abschließen." });
+          await bot.sendMessage(chatId, `⚠️ Bitte schließe dein Stripe-Onboarding ab:\n${link.url}`);
           return;
         }
 
@@ -694,12 +786,15 @@ async function bootstrapTelegram() {
     }
   });
 
-  // jede Message → Kontaktzeit
+  // jede Message → Kontaktzeit (creator_id hier meist unbekannt → klassisches Update)
   bot.on("message", async (msg) => {
     if (!msg?.from) return;
     try {
       await supabase.from("vip_users").update({ letzter_kontakt: nowTS() }).eq("telegram_id", String(msg.from.id));
-    } catch {}
+    } catch (e) {
+      console.error("letzter_kontakt update error:", e?.message || e);
+      await logVipUserError({ scope: "last_contact_update", telegram_id: String(msg.from.id) }, e);
+    }
   });
 }
 
@@ -833,10 +928,18 @@ app.post("/stripe/webhook", async (req, res) => {
       const days = Number(vipDaysMeta ?? cfg?.vip_days ?? cfg?.vip_dauer ?? 30);
       const vip_bis = addDaysISO(days);
 
-      const { data: vipRow } = await supabase.from("vip_users").upsert(
-        { creator_id, telegram_id, chat_id, status: "aktiv", vip_bis },
-        { onConflict: "creator_id,telegram_id" }
-      ).select("telegram_id, chat_id").maybeSingle();
+      // ✅ NEU: robuster Upsert
+      const resVip = await setVipStatus({
+        creator_id,
+        telegram_id,
+        chat_id,
+        status: "aktiv",
+        vip_bis,
+        letztes_event: "checkout.session.completed",
+        extra: { stripe_session_id: s.id, stripe_account: event.account || null }
+      });
+
+      const vipRow = resVip?.data;
 
       if (cfg?.welcome_text) {
         await bot.sendMessage(Number(chat_id), escapeMDV2(cfg.welcome_text), { parse_mode: "MarkdownV2" });
@@ -849,13 +952,13 @@ app.post("/stripe/webhook", async (req, res) => {
           chat_id_or_user_id: vipRow?.chat_id || chat_id
         });
         if (!result.ok && cfg?.gruppe_link) {
-          await bot.sendMessage(Number(chat_id), `🔗 Fallback‑Zugang: ${cfg.gruppe_link}`);
+          await bot.sendMessage(Number(chat_id), `🔗 Fallback-Zugang: ${cfg.gruppe_link}`);
         } else if (!result.ok) {
           await bot.sendMessage(Number(chat_id), "⚠️ Zugang aktuell nicht möglich. Bitte Support kontaktieren.");
         }
       } else {
         if (cfg?.gruppe_link) {
-          await bot.sendMessage(Number(chat_id), `🔗 Dein VIP‑Zugang: ${cfg.gruppe_link}`);
+          await bot.sendMessage(Number(chat_id), `🔗 Dein VIP-Zugang: ${cfg.gruppe_link}`);
         } else {
           await bot.sendMessage(Number(chat_id), "⚠️ Der Creator hat noch keine Gruppe verbunden.");
         }
@@ -877,10 +980,17 @@ app.post("/stripe/webhook", async (req, res) => {
       if (!creator_id || !telegram_id) return;
 
       const vip_bis = addDaysISO(vipDays);
-      await supabase.from("vip_users").upsert(
-        { creator_id, telegram_id, chat_id, status: "aktiv", vip_bis },
-        { onConflict: "creator_id,telegram_id" }
-      );
+
+      // ✅ NEU: robuster Upsert
+      await setVipStatus({
+        creator_id,
+        telegram_id,
+        chat_id,
+        status: "aktiv",
+        vip_bis,
+        letztes_event: "invoice.paid",
+        extra: { invoice_id: inv.id, sub_id: subId }
+      });
     } catch (e) {
       console.error("invoice.paid handler error:", e.message);
     }
@@ -894,8 +1004,13 @@ app.post("/stripe/webhook", async (req, res) => {
       const telegram_id = md.telegram_id;
       if (!creator_id || !telegram_id) return;
 
-      await supabase.from("vip_users").update({ status: "gekündigt" })
-        .eq("creator_id", creator_id).eq("telegram_id", telegram_id);
+      // ✅ NEU: Status sauber setzen (mit letztem Kontakt)
+      await setVipStatus({
+        creator_id,
+        telegram_id,
+        status: "gekündigt",
+        letztes_event: "customer.subscription.deleted"
+      });
     } catch (e) {
       console.error("subscription.deleted handler error:", e.message);
     }
@@ -958,6 +1073,17 @@ cron.schedule("0 8 * * *", async () => {
 app.get("/", (_, res) => res.send("Luxbot up"));
 app.get("/stripe/success", (_, res) => res.send("✅ Zahlung erfolgreich. Der Bot sendet dir gleich den Zugang in Telegram."));
 app.get("/stripe/cancel",  (_, res) => res.send("❌ Zahlung abgebrochen."));
+
+// ✅ NEU: DB-Probe (optional; Tabelle 'health_probe' mit Spalte 'ts' anlegen oder Route entfernen)
+app.get("/health/db", async (_, res) => {
+  try {
+    const { error } = await supabase.from("health_probe").insert({ ts: new Date().toISOString() }).select("*").maybeSingle();
+    if (error) return res.status(500).json({ ok: false, error: error.message });
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Start
