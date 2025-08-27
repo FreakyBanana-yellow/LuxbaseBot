@@ -1062,7 +1062,7 @@ app.post("/stripe/webhook", async (req, res) => {
 cron.schedule("* * * * *", async () => {
   console.log("⏱️ Test-Cron läuft minütlich");
   // dein Ablauf-Check
-});
+})
 
   // Warnen
   const { data: warnUsers } = await supabase.from("vip_users")
