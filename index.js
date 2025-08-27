@@ -1056,33 +1056,115 @@ app.post("/stripe/webhook", async (req, res) => {
 
   res.json({ received: true });
 });
+// ──────────────────────────────────────────────────────────────────────────────
+// Renewal-Checkout-Link erzeugen (Stripe)
+// ──────────────────────────────────────────────────────────────────────────────
+async function createRenewalCheckout({ creator_id, telegram_id, chat_id }) {
+  if (!stripe) return null;
+
+  const creator = await getCreatorCfgById(creator_id);
+  if (!creator || !creator.preis) return null;
+
+  const acct = creator.stripe_account_id;
+  if (!acct) return null;
+
+  try {
+    const account = await stripe.accounts.retrieve(acct);
+    const caps = account.capabilities || {};
+    const transfersActive = caps.transfers === "active";
+    const cardActive      = caps.card_payments === "active";
+    const payoutsEnabled  = !!account.payouts_enabled;
+
+    const amountCents = Math.max(0, Math.round(Number(creator.preis || 0) * 100));
+    const vipDays     = Number(creator.vip_days ?? creator.vip_dauer ?? 30);
+    const feePct      = creator.application_fee_pct != null ? Number(creator.application_fee_pct) : null;
+
+    const lineItem = {
+      quantity: 1,
+      price_data: {
+        currency: "eur",
+        unit_amount: amountCents,
+        recurring: { interval: "day", interval_count: vipDays },
+        product_data: { name: `VIP-Bot Zugang – ${String(creator_id).slice(0,8)}`, metadata: { creator_id } }
+      }
+    };
+
+    let session;
+    if (transfersActive && payoutsEnabled) {
+      session = await stripe.checkout.sessions.create({
+        mode: "subscription",
+        success_url: `${BASE_URL}/stripe/success`,
+        cancel_url:  `${BASE_URL}/stripe/cancel`,
+        allow_promotion_codes: true,
+        line_items: [lineItem],
+        subscription_data: {
+          transfer_data: { destination: acct },
+          ...(feePct != null ? { application_fee_percent: feePct } : {}),
+          metadata: { creator_id, telegram_id, chat_id: String(chat_id), vip_days: String(vipDays) }
+        },
+        metadata: { creator_id, telegram_id, chat_id: String(chat_id), vip_days: String(vipDays) }
+      });
+    } else if (cardActive) {
+      session = await stripe.checkout.sessions.create({
+        mode: "subscription",
+        success_url: `${BASE_URL}/stripe/success`,
+        cancel_url:  `${BASE_URL}/stripe/cancel`,
+        allow_promotion_codes: true,
+        line_items: [lineItem],
+        subscription_data: {
+          ...(feePct != null ? { application_fee_percent: feePct } : {}),
+          metadata: { creator_id, telegram_id, chat_id: String(chat_id), vip_days: String(vipDays) }
+        },
+        metadata: { creator_id, telegram_id, chat_id: String(chat_id), vip_days: String(vipDays) }
+      }, { stripeAccount: acct });
+    } else {
+      return null;
+    }
+    return session?.url || null;
+  } catch (e) {
+    console.error("createRenewalCheckout error:", e?.message || e);
+    return null;
+  }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Daily/Minutely Check – Reminder & Kick
+// Daily Check – Reminder (mit Verlängerungslink) & Kick
 // ──────────────────────────────────────────────────────────────────────────────
-
-// Stelle für Tests minütlich; für Produktion lieber "0 8 * * *"
-const CRON_EXPR = process.env.CRON_EXPR || "* * * * *";
+const CRON_EXPR = process.env.CRON_EXPR || "0 8 * * *"; // jeden Tag 08:00 Uhr
 
 async function runExpirySweep() {
   const today = todayISO();
   const warnDate = addDaysISO(5);
 
-  // Warnen (läuft in <= 5 Tagen ab)
+  // Reminder mit Verlängerungslink
   const { data: warnUsers } = await supabase.from("vip_users")
-    .select("telegram_id, chat_id, vip_bis")
+    .select("creator_id, telegram_id, chat_id, vip_bis")
     .gte("vip_bis", today).lte("vip_bis", warnDate).eq("status", "aktiv");
 
   for (const u of warnUsers || []) {
     try {
-      await bot.sendMessage(
-        Number(u.chat_id || u.telegram_id),
-        `⏰ Dein VIP läuft am ${u.vip_bis} ab. Verlängere rechtzeitig mit /start → „Jetzt bezahlen“.`
-      );
-    } catch {}
+      const url = await createRenewalCheckout({
+        creator_id: u.creator_id,
+        telegram_id: String(u.telegram_id),
+        chat_id: String(u.chat_id || u.telegram_id)
+      });
+
+      const text = `⏰ Dein VIP läuft am ${u.vip_bis} ab.\nVerlängere rechtzeitig, um drin zu bleiben.`;
+      if (url) {
+        await bot.sendMessage(Number(u.chat_id || u.telegram_id), text, {
+          reply_markup: { inline_keyboard: [[{ text: "🔁 VIP jetzt verlängern", url }]] }
+        });
+      } else {
+        await bot.sendMessage(Number(u.chat_id || u.telegram_id),
+          `${text}\n\nTipp: Nutze /start und klicke „Jetzt bezahlen“.`
+        );
+      }
+    } catch (e) {
+      console.error("warn send error:", e?.message || e);
+    }
   }
 
-  // Abgelaufen → kicken
+  // Abgelaufene → kicken
   const { data: expired } = await supabase.from("vip_users")
     .select("creator_id, telegram_id, chat_id, vip_bis")
     .lt("vip_bis", today).eq("status", "aktiv");
@@ -1090,6 +1172,7 @@ async function runExpirySweep() {
   if (expired?.length) {
     const { data: cfgs } = await supabase.from("creator_config").select("creator_id, group_chat_id");
     const map = new Map((cfgs || []).map(c => [c.creator_id, c.group_chat_id]));
+
     for (const u of expired) {
       const group = map.get(u.creator_id);
       if (!group) continue;
@@ -1112,7 +1195,7 @@ async function runExpirySweep() {
 
         await bot.sendMessage(
           Number(u.chat_id || u.telegram_id),
-          `❌ Dein VIP ist abgelaufen. Du wurdest aus der Gruppe entfernt. Mit /start → „Jetzt bezahlen“ kannst du jederzeit verlängern.`
+          `❌ Dein VIP ist abgelaufen. Du wurdest aus der Gruppe entfernt.\nMit /start → „Jetzt bezahlen“ kannst du jederzeit verlängern.`
         );
       } catch {}
     }
@@ -1126,40 +1209,4 @@ cron.schedule(CRON_EXPR, async () => {
   } catch (e) {
     console.error("expiry sweep error:", e?.message || e);
   }
-});
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Health
-// ──────────────────────────────────────────────────────────────────────────────
-app.get("/", (_, res) => res.send("Luxbot up"));
-app.get("/stripe/success",    (_, res) => res.send("✅ Zahlung erfolgreich. Der Bot sendet dir gleich den Zugang in Telegram."));
-app.get("/stripe/cancel",     (_, res) => res.send("❌ Zahlung abgebrochen."));
-app.get("/health/db", async (_, res) => {
-  try {
-    const { error } = await supabase.from("health_probe").insert({ ts: new Date().toISOString() }).select("*").maybeSingle();
-    if (error) return res.status(500).json({ ok: false, error: error.message });
-    return res.json({ ok: true });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
-});
-
-// ──────────────────────────────────────────────────────────────────────────────
-// DEV ONLY: Manuell den Ablauf-Check triggern (zum Testen)
-// ──────────────────────────────────────────────────────────────────────────────
-app.post("/admin/run-expiry", async (_req, res) => {
-  try {
-    await runExpirySweep();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
-});
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Start
-// ──────────────────────────────────────────────────────────────────────────────
-app.listen(PORT, async () => {
-  console.log(`🚀 on :${PORT}  webhook: ${telegramWebhook}`);
-  await bootstrapTelegram();
 });
