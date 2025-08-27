@@ -5,7 +5,6 @@ import TelegramBot from "node-telegram-bot-api";
 import Stripe from "stripe";
 import { createClient } from "@supabase/supabase-js";
 import bodyParser from "body-parser";
-import fetch from "node-fetch";
 import cron from "node-cron";
 
 dotenv.config();
