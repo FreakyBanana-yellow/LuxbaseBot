@@ -6,16 +6,17 @@ import { createClient } from "@supabase/supabase-js";
 import Stripe from "stripe";
 import cron from "node-cron";
 
-/* ────────────────────────────────────────────────────────────────────────────
-   ENV
-   ──────────────────────────────────────────────────────────────────────────── */
+/* -------------------------------------------------------------------------- */
+/* ENV                                                                        */
+/* -------------------------------------------------------------------------- */
 const {
   BOT_TOKEN,
-  BASE_URL, // z.B. https://dein-service.onrender.com
+  BASE_URL, // z.B. https://luxbasebot.onrender.com
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
-  STRIPE_SECRET_KEY,
-  STRIPE_WEBHOOK_SECRET,
+  SUPABASE_ANON_KEY,        // optional (wir lesen eh mit Service-Role)
+  STRIPE_SECRET_KEY,        // optional
+  STRIPE_WEBHOOK_SECRET,    // optional
   PORT = 3000
 } = process.env;
 
@@ -23,8 +24,7 @@ if (!BOT_TOKEN || !BASE_URL) {
   console.error("❌ BOT_TOKEN oder BASE_URL fehlt.");
   process.exit(1);
 }
-
-const SB_URL = SUPABASE_URL;
+const SB_URL = SUPABASE_URL || process.env.PUBLIC_SUPABASE_URL;
 if (!SB_URL) {
   console.error("❌ SUPABASE_URL fehlt.");
   process.exit(1);
@@ -34,64 +34,38 @@ if (!SUPABASE_SERVICE_ROLE_KEY) {
   process.exit(1);
 }
 
-console.log("ENV CHECK:", {
-  has_SUPABASE_URL: !!SB_URL,
-  has_SERVICE_ROLE: !!SUPABASE_SERVICE_ROLE_KEY,
-  has_BOT_TOKEN: !!BOT_TOKEN,
-  has_BASE_URL: !!BASE_URL
-});
-
-/* ────────────────────────────────────────────────────────────────────────────
-   Supabase: Nur Admin-Client (Service Role)
-   ──────────────────────────────────────────────────────────────────────────── */
+/* -------------------------------------------------------------------------- */
+/* Supabase Clients                                                           */
+/* -------------------------------------------------------------------------- */
 const supabaseAdmin = createClient(SB_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false }
 });
+const supabaseAnon = createClient(SB_URL, SUPABASE_ANON_KEY || "", {
+  auth: { persistSession: false }
+});
 
-/* ────────────────────────────────────────────────────────────────────────────
-   Helpers
-   ──────────────────────────────────────────────────────────────────────────── */
+/* -------------------------------------------------------------------------- */
+/* Helpers                                                                    */
+/* -------------------------------------------------------------------------- */
 const nowTS = () => new Date().toISOString().replace("T", " ").replace("Z", "");
 const todayISO = () => new Date().toISOString().slice(0, 10);
-const addDaysISO = (d) => new Date(Date.now() + d * 864e5).toISOString().slice(0, 10);
 
-// Telegram MarkdownV2 escapen
 function escapeMDV2(s = "") {
   return String(s).replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
 }
 
-// In-Memory Consent-State (optional)
 const consentState = new Map();
-const modelWizard = new Map();
-function getMW(userId) {
-  const k = String(userId);
-  if (!modelWizard.has(k)) modelWizard.set(k, {});
-  return modelWizard.get(k);
-}
 
-// Deep-Link Payload: /start <payload>
-// Akzeptiert: cid_<uuid> | creator_<uuid> | <uuid> | (optional) base64url-encodet uuid
+// Deep-Link Payload: /start cid_<uuid>
 function parseCreatorFromStart(text = "") {
-  const m = text?.match(/^\/start(?:\s+(.+))?/i);
+  const m = text?.match?.(/^\/start\s+([^\s]+)$/i);
   if (!m) return null;
-  const payload = (m[1] || "").trim();
-  if (!payload) return null;
-
-  // Varianten zulassen
-  if (/^cid_/i.test(payload))      return payload.slice(4);
-  if (/^creator_/i.test(payload))  return payload.slice(8);
-  if (/^[0-9a-f-]{36}$/i.test(payload)) return payload; // nackte UUID
-
-  // optional: base64url -> uuid
-  try {
-    const decoded = Buffer.from(payload, "base64url").toString("utf8").trim();
-    if (/^[0-9a-f-]{36}$/i.test(decoded)) return decoded;
-  } catch {}
-  return null;
+  const payload = m[1];
+  const mCid = payload.match(/^cid_(.+)$/i);
+  return mCid ? mCid[1] : null;
 }
 
-
-// Flirty Welcome
+// Welcome
 function buildWelcomeMessage(creator, firstName = "") {
   const price = Number(creator?.preis || 0).toFixed(0);
   const days  = Number(creator?.vip_days ?? creator?.vip_dauer ?? 30);
@@ -105,7 +79,7 @@ function buildWelcomeMessage(creator, firstName = "") {
 Hier bekommst du meinen **privatesten VIP-Zugang** – nur die heißesten Inhalte, direkt von mir zu dir.`
       ).trim();
 
-  const metaRaw = `\n\n💶 ${price} €  •  ⏳ ${days} Tage exklusiv`;
+  const metaRaw   = `\n\n💶 ${price} €  •  ⏳ ${days} Tage exklusiv`;
   const confirmRaw =
 `\n\nBevor ich dich reinlasse, brauch ich nur dein Go:
 1) 🔞 Du bist wirklich 18+
@@ -116,7 +90,7 @@ Danach öffne ich dir meine VIP-Welt… es wird **heiß** 😏`;
   return escapeMDV2(baseRaw + metaRaw + confirmRaw);
 }
 
-// DB Helpers (Admin, mit Error-Logs)
+/* ------------------------------- SB Helpers -------------------------------- */
 async function sbAdminUpsert(table, payload, opts) {
   const { data, error } = await supabaseAdmin.from(table).upsert(payload, opts);
   if (error) {
@@ -148,11 +122,8 @@ async function getCreatorCfgById(creator_id) {
   return await sbSelect("creator_config", "*", { creator_id }, true);
 }
 
-/* ────────────────────────────────────────────────────────────────────────────
-   Invite-Checks: Nur Einmallink-Beitritte erlauben
-   ──────────────────────────────────────────────────────────────────────────── */
+/* ----------------------- Invite: nur Einmallinks erlauben ------------------- */
 async function findValidInvite({ creator_id, group_chat_id, telegram_id, invite_url }) {
-  // 1) exakte URL prüfen
   let row = null;
   if (invite_url) {
     row = await sbSelect(
@@ -167,7 +138,6 @@ async function findValidInvite({ creator_id, group_chat_id, telegram_id, invite_
       true
     ).catch(() => null);
   }
-  // 2) Fallback: usergebundener Link
   if (!row) {
     row = await sbSelect(
       "invite_links",
@@ -182,35 +152,42 @@ async function findValidInvite({ creator_id, group_chat_id, telegram_id, invite_
     ).catch(() => null);
   }
   if (!row) return null;
-
   if (row.telegram_id && String(row.telegram_id) !== String(telegram_id)) return null;
   if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) return null;
-
   return row;
 }
-
 async function markInviteUsed({ id, used_by }) {
-  await sbAdminUpdate(
-    "invite_links",
-    { used: true, used_at: nowTS(), used_by: String(used_by) },
-    { id }
-  );
+  await sbAdminUpdate("invite_links", { used: true, used_at: nowTS(), used_by: String(used_by) }, { id });
 }
 
-/* ────────────────────────────────────────────────────────────────────────────
-   Express + Webhook Setup
-   ──────────────────────────────────────────────────────────────────────────── */
+/* -------------------------------------------------------------------------- */
+/* Express + Telegram                                                         */
+/* -------------------------------------------------------------------------- */
 const app = express();
-const bot = new TelegramBot(BOT_TOKEN);
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
-// Telegram Webhook
 const telegramPath = `/bot${BOT_TOKEN}`;
 const telegramWebhook = `${BASE_URL}${telegramPath}`;
 
-// Stripe
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
-// Stripe RAW body (Signaturprüfung), vor json()
+/* ------------------------------ Webhook Retry ------------------------------ */
+async function setWebhookWithRetry(url, tries = 3) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const ok = await bot.setWebHook(url);
+      if (ok) return true;
+    } catch (e) {
+      const wait = (e?.response?.body?.parameters?.retry_after ?? 1) * 1000;
+      console.warn(`Webhook set failed (try ${i + 1}/${tries}):`, e?.message || e);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  return false;
+}
+
+/* ------------------------------- Stripe Hook ------------------------------- */
+// RAW body (Signatur)
 app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
   if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.sendStatus(200);
 
@@ -229,7 +206,7 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
       const customerId = invoice.customer ? String(invoice.customer) : null;
 
       if (customerId) {
-        const row = await sbSelect("vip_users", "creator_id, telegram_id, chat_id", { stripe_customer_id: customerId }, true);
+        const row = await sbSelect("vip_users", "creator_id, telegram_id", { stripe_customer_id: customerId }, true);
         if (row?.creator_id && row?.telegram_id) {
           await extendMembership({ creator_id: row.creator_id, telegram_id: row.telegram_id, days: 30 });
         }
@@ -249,11 +226,7 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
           stripe_customer_id: customerId
         }, { onConflict: "creator_id,telegram_id" });
 
-        await extendMembership({
-          creator_id: creatorIdFromMeta,
-          telegram_id: telegramIdFromMeta,
-          days: 30
-        });
+        await extendMembership({ creator_id: creatorIdFromMeta, telegram_id: telegramIdFromMeta, days: 30 });
       } else if (customerId) {
         const row = await sbSelect("vip_users", "creator_id, telegram_id", { stripe_customer_id: customerId }, true);
         if (row?.creator_id && row?.telegram_id) {
@@ -269,37 +242,47 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
   }
 });
 
-// JSON-Parser für alle anderen Routen (Stripe liegt davor!)
+/* ------------------------ JSON parser & Telegram hook ---------------------- */
 app.use(bodyParser.json());
 
-// Telegram Webhook Endpoint (Logs)
 app.post(telegramPath, (req, res) => {
   console.log("Webhook update:", JSON.stringify(req.body));
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
-// Health
+/* ---------------------------- Health + Connect API ------------------------- */
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/health", (_req, res) => res.json({ ok: true, base_url: BASE_URL, supabase_url_present: !!SB_URL }));
 
-/* ────────────────────────────────────────────────────────────────────────────
-   VIP-Status & Reminder Helpers
-   ──────────────────────────────────────────────────────────────────────────── */
+// 👉 Dashboard-Button „Bot verbinden“ kann diesen Endpoint aufrufen
+app.get("/api/bot/connect", async (_req, res) => {
+  try {
+    const ok = await setWebhookWithRetry(telegramWebhook, 5);
+    res.json({ ok, webhook: telegramWebhook });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* VIP Helpers                                                                */
+/* -------------------------------------------------------------------------- */
 const isActive = (row) => {
   if (!row?.vip_bis) return false;
   const until = new Date(row.vip_bis);
   return until.getTime() > Date.now();
 };
 
-async function notifyDMorGroup({ chatId, userId, text, parse_mode = "MarkdownV2" }) {
+// DM zuerst, Fallback: in die Gruppe (wenn übergeben)
+async function notifyDMorGroup({ group_chat_id, userId, text, parse_mode = "MarkdownV2" }) {
   try {
     await bot.sendMessage(Number(userId), text, { parse_mode });
     return;
   } catch {
-    if (chatId) {
+    if (group_chat_id) {
       await bot.sendMessage(
-        Number(chatId),
+        Number(group_chat_id),
         `🔔 <a href="tg://user?id=${userId}">Hinweis</a>:\n${text}`,
         { parse_mode: "HTML" }
       );
@@ -308,10 +291,7 @@ async function notifyDMorGroup({ chatId, userId, text, parse_mode = "MarkdownV2"
 }
 
 async function markWarning({ creator_id, telegram_id, type }) {
-  await sbAdminUpdate("vip_users", {
-    letzte_erinnerung: type,
-    warned_at: nowTS()
-  }, { creator_id, telegram_id });
+  await sbAdminUpdate("vip_users", { letzte_erinnerung: type, warned_at: nowTS() }, { creator_id, telegram_id });
 }
 
 async function setMembership({ creator_id, telegram_id, untilISO, active, paid }) {
@@ -319,27 +299,21 @@ async function setMembership({ creator_id, telegram_id, untilISO, active, paid }
   if (untilISO) patch.vip_bis = untilISO;
   if (active !== undefined) patch.status = active ? "active" : "inactive";
   if (paid !== undefined) patch.zahlung_ok = !!paid;
-
   await sbAdminUpdate("vip_users", patch, { creator_id, telegram_id });
 }
 
-// +X Tage (ab jetzt oder ab bestehendem vip_bis – späteres Datum gewinnt)
 async function extendMembership({ creator_id, telegram_id, days = 30 }) {
-  const row = await sbSelect("vip_users", "vip_bis, chat_id", { creator_id, telegram_id }, true);
+  const row = await sbSelect("vip_users", "vip_bis", { creator_id, telegram_id }, true);
 
   const base = row?.vip_bis && new Date(row.vip_bis) > new Date()
     ? new Date(row.vip_bis)
     : new Date();
 
   const newUntil = new Date(base.getTime() + days * 864e5);
-  await setMembership({
-    creator_id, telegram_id,
-    untilISO: newUntil.toISOString(),
-    active: true, paid: true
-  });
+  await setMembership({ creator_id, telegram_id, untilISO: newUntil.toISOString(), active: true, paid: true });
 
   await notifyDMorGroup({
-    chatId: row?.chat_id,
+    group_chat_id: null,
     userId: telegram_id,
     text: escapeMDV2(`✅ Danke! Deine VIP-Mitgliedschaft wurde bis ${newUntil.toLocaleDateString()} verlängert (+${days} Tage).`)
   });
@@ -360,7 +334,7 @@ async function kickFromGroup({ group_chat_id, telegram_id }) {
 }
 
 async function handleExpiry({ creator_id, telegram_id, group_chat_id }) {
-  const row = await sbSelect("vip_users", "vip_bis, zahlung_ok, status, chat_id", { creator_id, telegram_id }, true);
+  const row = await sbSelect("vip_users", "vip_bis, zahlung_ok, status", { creator_id, telegram_id }, true);
   if (!row) return;
   if (isActive(row)) return;
 
@@ -368,7 +342,7 @@ async function handleExpiry({ creator_id, telegram_id, group_chat_id }) {
 
   const kicked = await kickFromGroup({ group_chat_id, telegram_id });
   await notifyDMorGroup({
-    chatId: row?.chat_id,
+    group_chat_id,
     userId: telegram_id,
     text: escapeMDV2(
       `❌ Deine VIP-Mitgliedschaft ist abgelaufen${kicked ? " und du wurdest aus der VIP-Gruppe entfernt" : ""}.\n` +
@@ -377,11 +351,35 @@ async function handleExpiry({ creator_id, telegram_id, group_chat_id }) {
   });
 }
 
-/* ────────────────────────────────────────────────────────────────────────────
-   Telegram – Bootstrap
-   ──────────────────────────────────────────────────────────────────────────── */
+/* -------------------------------------------------------------------------- */
+/* Telegram Bootstrap                                                          */
+/* -------------------------------------------------------------------------- */
+async function findCreatorIdForUser({ userId, chatId }) {
+  // 1) exakte Kombi (falls Spalte in DB existiert – wenn nicht, Fehler wird gefangen)
+  try {
+    const row = await sbSelect("vip_users", "creator_id", { telegram_id: String(userId), chat_id: String(chatId) }, true);
+    if (row?.creator_id) return row.creator_id;
+  } catch {}
+
+  // 2) Fallback: nur telegram_id → jüngster Eintrag
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("vip_users")
+      .select("creator_id, created_at")
+      .eq("telegram_id", String(userId))
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    return data?.creator_id || null;
+  } catch (e) {
+    console.error("findCreatorIdForUser fallback error:", e.message);
+    return null;
+  }
+}
+
 async function bootstrapTelegram() {
-  await bot.setWebHook(telegramWebhook);
+  await setWebhookWithRetry(telegramWebhook, 5);
 
   // /start – nutzt Deep-Link payload: /start cid_<creator_uuid>
   bot.onText(/^\/start\b/i, async (msg) => {
@@ -389,34 +387,26 @@ async function bootstrapTelegram() {
     const userId = String(msg.from.id);
     const username = msg.from.username || null;
 
-    // 1) versuche Payload
     let creator_id = parseCreatorFromStart(msg.text);
 
-    // 2) Gruppen-Fallback über group_chat_id → creator_config
     if (!creator_id && (msg.chat.type === "group" || msg.chat.type === "supergroup")) {
       const cfg = await sbSelect("creator_config", "creator_id", { group_chat_id: String(chatId) }, true);
       creator_id = cfg?.creator_id || null;
     }
 
-    // 3) Ohne Creator kein Upsert → bitte offiziellen Link nutzen
     if (!creator_id) {
       await bot.sendMessage(chatId, "Ich konnte deinen Creator nicht erkennen. Bitte nutze den offiziellen Start-Link.");
       return;
     }
 
-    await sbAdminUpsert("vip_users", {
-      creator_id,
-      telegram_id: userId,
-      username,
-      chat_id: String(chatId),
-      letzter_kontakt: nowTS(),
-      status: "inactive",
-      zahlung_ok: false
-    }, { onConflict: "creator_id,telegram_id" });
+    await sbAdminUpsert(
+      "vip_users",
+      { creator_id, telegram_id: userId, username, letzter_kontakt: nowTS(), status: "inactive", zahlung_ok: false },
+      { onConflict: "creator_id,telegram_id" }
+    );
 
     const creator = await getCreatorCfgById(creator_id);
 
-    // Optional: Voice
     if (creator?.voice_enabled && creator?.voice_file_id && msg.chat.type === "private") {
       try {
         await bot.sendVoice(chatId, creator.voice_file_id, {
@@ -428,10 +418,8 @@ async function bootstrapTelegram() {
       }
     }
 
-    // Consent State reset
     consentState.set(`${creator_id}:${userId}`, { age: false, rules: false });
 
-    // Welcome + Buttons
     const text = buildWelcomeMessage(creator || {}, msg.from.first_name || "");
     const kb = {
       inline_keyboard: [
@@ -440,30 +428,25 @@ async function bootstrapTelegram() {
         [{ text: "✅ Regeln akzeptieren", callback_data: "btn_accept_rules" }]
       ]
     };
-
     await bot.sendMessage(chatId, text, { reply_markup: kb, parse_mode: "MarkdownV2" });
   });
 
-  // Callback-Buttons
+  // Callback-Buttons (robust, immer Antwort)
   bot.on("callback_query", async (q) => {
+    const data = q.data;
+    const chatId = q.message?.chat?.id;
+    const userId = String(q.from?.id);
+
     try {
-      const data = q.data;
-      const chatId = q.message?.chat?.id;
-      const userId = String(q.from?.id);
+      const creator_id = await findCreatorIdForUser({ userId, chatId });
 
-      const me = await sbSelect("vip_users", "creator_id", {
-        telegram_id: userId,
-        chat_id: String(chatId)
-      }, true);
-
-      const creator_id = me?.creator_id || null;
       if (!creator_id) {
-        await bot.answerCallbackQuery(q.id, { text: "Kein Creator-Kontext gefunden.", show_alert: true });
+        await bot.answerCallbackQuery(q.id, { text: "Kein Creator-Kontext gefunden. Bitte /start Link erneut nutzen.", show_alert: true });
         return;
       }
 
       if (data === "btn_age") {
-        await sbAdminUpdate("vip_users", { alter_ok: true }, { creator_id, telegram_id: userId });
+        await sbAdminUpdate("vip_users", { alter_ok: true, letzter_kontakt: nowTS() }, { creator_id, telegram_id: userId });
         await bot.answerCallbackQuery(q.id, { text: "✅ Alter bestätigt!" });
         return;
       }
@@ -477,41 +460,37 @@ async function bootstrapTelegram() {
       }
 
       if (data === "btn_accept_rules") {
-        await sbAdminUpdate("vip_users", { regeln_ok: true }, { creator_id, telegram_id: userId });
+        await sbAdminUpdate("vip_users", { regeln_ok: true, letzter_kontakt: nowTS() }, { creator_id, telegram_id: userId });
         await bot.answerCallbackQuery(q.id, { text: "✅ Regeln akzeptiert!" });
         await bot.sendMessage(chatId, "Perfekt! 🎉 Sobald deine Zahlung eingegangen ist, geht es los.");
         return;
       }
+
+      await bot.answerCallbackQuery(q.id, { text: "🤔 Unbekannte Aktion." });
     } catch (e) {
       console.error("callback_query error:", e.message);
+      try { await bot.answerCallbackQuery(q.id, { text: "⚠️ Fehler. Bitte erneut tippen." }); } catch {}
     }
   });
 
-  // Aktivitäts-Updates bei Voice/Audio/Video-Note
+  // Aktivitäts-Pings
   for (const ev of ["voice", "audio", "video_note"]) {
     bot.on(ev, async (msg) => {
       const uid = msg.from?.id ? String(msg.from.id) : null;
       if (!uid) return;
+      try { await sbAdminUpdate("vip_users", { letzter_kontakt: nowTS() }, { telegram_id: uid }); } catch (e) {}
       try {
-        await sbAdminUpdate("vip_users", { letzter_kontakt: nowTS() }, { telegram_id: uid });
-      } catch (e) {
-        console.error(`${ev} update error:`, e.message);
-      }
-      try {
-        const label = ev === "voice" ? "Sprachnachricht"
-                   : ev === "audio" ? "Audio"
-                   : "Videonote";
+        const label = ev === "voice" ? "Sprachnachricht" : ev === "audio" ? "Audio" : "Videonote";
         await bot.sendMessage(msg.chat.id, `🎤 ${label} erhalten. Danke!`);
       } catch {}
     });
   }
 
-  // 🔒 NEU: Beitrittsanfragen (Gruppen mit „Join Request“) → nur mit gültigem Einmallink
+  // Join-Request (nur gültiger Einmallink → approve, sonst decline)
   bot.on("chat_join_request", async (req) => {
     try {
       const groupId = String(req.chat.id);
       const telegram_id = String(req.from.id);
-
       const cfg = await sbSelect("creator_config", "creator_id", { group_chat_id: groupId }, true);
       const creator_id = cfg?.creator_id || null;
       if (!creator_id) return;
@@ -524,14 +503,11 @@ async function bootstrapTelegram() {
         return;
       }
 
-      await sbAdminUpsert("vip_users", {
-        creator_id,
-        telegram_id,
-        chat_id: groupId,
-        letzter_kontakt: nowTS(),
-        status: "inactive",
-        zahlung_ok: false
-      }, { onConflict: "creator_id,telegram_id" });
+      await sbAdminUpsert(
+        "vip_users",
+        { creator_id, telegram_id, letzter_kontakt: nowTS(), status: "inactive", zahlung_ok: false },
+        { onConflict: "creator_id,telegram_id" }
+      );
 
       await markInviteUsed({ id: valid.id, used_by: telegram_id });
       await bot.approveChatJoinRequest(Number(groupId), Number(telegram_id)).catch(() => {});
@@ -541,16 +517,14 @@ async function bootstrapTelegram() {
     }
   });
 
-  // 🔒 Direkter Join (klassisch) → nur mit gültigem Einmallink, sonst Kick
+  // Klassischer Join (nur mit gültigem Einmallink → sonst Kick)
   bot.on("message", async (msg) => {
     if (!msg?.new_chat_members?.length) return;
-
     const groupId = String(msg.chat.id);
     const cfg = await sbSelect("creator_config", "creator_id", { group_chat_id: groupId }, true);
     const creator_id = cfg?.creator_id || null;
     if (!creator_id) return;
 
-    // Telegram liefert bei Join via Link u.U. message.invite_link (ChatInviteLink)
     const inviteUrl = msg?.invite_link?.invite_link || msg?.invite_link?.url || null;
 
     for (const m of msg.new_chat_members) {
@@ -558,28 +532,22 @@ async function bootstrapTelegram() {
       const telegram_id = String(m.id);
 
       const valid = await findValidInvite({ creator_id, group_chat_id: groupId, telegram_id, invite_url: inviteUrl });
-
       if (!valid) {
         await kickFromGroup({ group_chat_id: groupId, telegram_id });
         continue;
       }
 
-      await sbAdminUpsert("vip_users", {
-        creator_id,
-        telegram_id,
-        chat_id: groupId,
-        letzter_kontakt: nowTS(),
-        status: "inactive",
-        zahlung_ok: false
-      }, { onConflict: "creator_id,telegram_id" });
+      await sbAdminUpsert(
+        "vip_users",
+        { creator_id, telegram_id, letzter_kontakt: nowTS(), status: "inactive", zahlung_ok: false },
+        { onConflict: "creator_id,telegram_id" }
+      );
 
       await markInviteUsed({ id: valid.id, used_by: telegram_id });
 
       const u = await sbSelect("vip_users", "vip_bis, zahlung_ok", { creator_id, telegram_id }, true);
       if (!u || !isActive(u)) {
-        await bot.sendMessage(Number(groupId),
-          `Hi ${m.first_name || ""}! Zahlung prüfen – danach schalte ich dich frei.`
-        );
+        await bot.sendMessage(Number(groupId), `Hi ${m.first_name || ""}! Zahlung prüfen – danach schalte ich dich frei.`);
       }
     }
   });
@@ -587,18 +555,16 @@ async function bootstrapTelegram() {
 
 bootstrapTelegram().catch(console.error);
 
-/* ────────────────────────────────────────────────────────────────────────────
-   Hourly Checks: 5 Tage / 24h Reminder + Kick
-   ──────────────────────────────────────────────────────────────────────────── */
+/* -------------------------------------------------------------------------- */
+/* Hourly Checks                                                              */
+/* -------------------------------------------------------------------------- */
 async function runVipChecks() {
   try {
-    // 1) Alle vip_users holen (ohne Join → keine Typkonflikte)
     const { data: rows, error } = await supabaseAdmin
       .from("vip_users")
-      .select("creator_id, telegram_id, vip_bis, zahlung_ok, letzte_erinnerung, warned_at, chat_id, status");
+      .select("creator_id, telegram_id, vip_bis, zahlung_ok, letzte_erinnerung, warned_at, status");
     if (error) throw error;
 
-    // 2) creator_config separat holen und in Map legen
     const { data: cfgs, error: cfgErr } = await supabaseAdmin
       .from("creator_config")
       .select("creator_id, group_chat_id");
@@ -626,14 +592,13 @@ async function runVipChecks() {
 
       const until = new Date(u.vip_bis);
 
-      // 5-Tage-Reminder
       if (until > in5dStart && until <= in5dEnd) {
         const lastType = u.letzte_erinnerung;
         const lastAt = u.warned_at ? new Date(u.warned_at) : null;
         const windowKey = in5dStart.toISOString().slice(0, 13);
         if (lastType !== "5d" || !lastAt || lastAt.toISOString().slice(0, 13) !== windowKey) {
           await notifyDMorGroup({
-            chatId: u.chat_id,
+            group_chat_id,
             userId: telegram_id,
             text: escapeMDV2(
               `⌛️ Heads-up: Deine VIP-Mitgliedschaft läuft in 5 Tagen ab (${until.toLocaleDateString()}).\n` +
@@ -644,14 +609,13 @@ async function runVipChecks() {
         }
       }
 
-      // 24h-Reminder
       if (until > in1dStart && until <= in1dEnd) {
         const lastType = u.letzte_erinnerung;
         const lastAt = u.warned_at ? new Date(u.warned_at) : null;
         const windowKey = in1dStart.toISOString().slice(0, 13);
         if (lastType !== "1d" || !lastAt || lastAt.toISOString().slice(0, 13) !== windowKey) {
           await notifyDMorGroup({
-            chatId: u.chat_id,
+            group_chat_id,
             userId: telegram_id,
             text: escapeMDV2(
               `⏰ Letzte Erinnerung: Deine VIP-Mitgliedschaft endet in 24 Stunden (${until.toLocaleString()}).\n` +
@@ -662,7 +626,6 @@ async function runVipChecks() {
         }
       }
 
-      // Abgelaufen → Kick
       if (until <= now && u.zahlung_ok !== true) {
         await handleExpiry({ creator_id, telegram_id, group_chat_id });
       }
@@ -672,27 +635,21 @@ async function runVipChecks() {
   }
 }
 
-// HTTP-Endpoint zum manuellen Auslösen
 app.get("/cron/run", async (_req, res) => {
   await runVipChecks();
   res.json({ ok: true });
 });
 
-// Stündlicher Cron
 cron.schedule("0 * * * *", () => {
   console.log("⏱️ runVipChecks()");
   runVipChecks();
 });
 
-/* ────────────────────────────────────────────────────────────────────────────
-   Start Server
-   ──────────────────────────────────────────────────────────────────────────── */
+/* -------------------------------------------------------------------------- */
+/* Start Server                                                               */
+/* -------------------------------------------------------------------------- */
 app.listen(PORT, async () => {
   console.log(`Server on :${PORT}`);
-  try {
-    await bot.setWebHook(telegramWebhook);
-    console.log("Telegram webhook set:", telegramWebhook);
-  } catch (e) {
-    console.error("Webhook set error", e);
-  }
+  const ok = await setWebhookWithRetry(telegramWebhook, 5);
+  console.log("Telegram webhook set:", telegramWebhook, ok ? "✅" : "⚠️ (Retry fehlgeschlagen)");
 });
