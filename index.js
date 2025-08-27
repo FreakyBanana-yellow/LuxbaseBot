@@ -1130,7 +1130,7 @@ async function createRenewalCheckout({ creator_id, telegram_id, chat_id }) {
 // ──────────────────────────────────────────────────────────────────────────────
 // Daily Check – Reminder (mit Verlängerungslink) & Kick
 // ──────────────────────────────────────────────────────────────────────────────
-const CRON_EXPR = process.env.CRON_EXPR || "0 8 * * *"; // jeden Tag 08:00 Uhr
+const CRON_EXPR = process.env.CRON_EXPR || "* * * * *"; // jeden Tag 08:00 Uhr
 
 async function runExpirySweep() {
   const today = todayISO();
