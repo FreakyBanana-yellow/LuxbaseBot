@@ -40,9 +40,9 @@ if (!SUPABASE_SERVICE_ROLE_KEY) {
 const supabaseAdmin = createClient(SB_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false }
 });
-const supabaseAnon = createClient(SB_URL, SUPABASE_ANON_KEY || "", {
-  auth: { persistSession: false }
-});
+const supabaseAnon = SUPABASE_ANON_KEY
+  ? createClient(SB_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false } })
+  : null;
 
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
@@ -56,13 +56,22 @@ function escapeMDV2(s = "") {
 
 const consentState = new Map();
 
-// Deep-Link Payload: /start cid_<uuid>
+/** Deep-Link Payloads: /start creator_<uuid> | cid_<uuid> | <uuid> | base64(uuid) */
 function parseCreatorFromStart(text = "") {
-  const m = text?.match?.(/^\/start\s+([^\s]+)$/i);
+  const m = text?.match?.(/^\/start(?:\s+(.+))?$/i);
   if (!m) return null;
-  const payload = m[1];
-  const mCid = payload.match(/^cid_(.+)$/i);
-  return mCid ? mCid[1] : null;
+  const payload = (m[1] || "").trim();
+  if (!payload) return null;
+
+  if (/^cid_/i.test(payload)) return payload.slice(4);
+  if (/^creator_/i.test(payload)) return payload.slice(8);
+  if (/^[0-9a-f-]{36}$/i.test(payload)) return payload;
+
+  try {
+    const decoded = Buffer.from(payload, "base64url").toString("utf8").trim();
+    if (/^[0-9a-f-]{36}$/i.test(decoded)) return decoded;
+  } catch {}
+  return null;
 }
 
 // Welcome
@@ -172,7 +181,7 @@ const telegramWebhook = `${BASE_URL}${telegramPath}`;
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 /* ------------------------------ Webhook Retry ------------------------------ */
-async function setWebhookWithRetry(url, tries = 3) {
+async function setWebhookWithRetry(url, tries = 5) {
   for (let i = 0; i < tries; i++) {
     try {
       const ok = await bot.setWebHook(url);
@@ -187,7 +196,6 @@ async function setWebhookWithRetry(url, tries = 3) {
 }
 
 /* ------------------------------- Stripe Hook ------------------------------- */
-// RAW body (Signatur)
 app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
   if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.sendStatus(200);
 
@@ -352,16 +360,15 @@ async function handleExpiry({ creator_id, telegram_id, group_chat_id }) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Telegram Bootstrap                                                          */
+/* Creator-Lookup für Callback-Buttons                                        */
 /* -------------------------------------------------------------------------- */
 async function findCreatorIdForUser({ userId, chatId }) {
-  // 1) exakte Kombi (falls Spalte in DB existiert – wenn nicht, Fehler wird gefangen)
+  // 1) exakte Kombi, falls Spalte existiert
   try {
     const row = await sbSelect("vip_users", "creator_id", { telegram_id: String(userId), chat_id: String(chatId) }, true);
     if (row?.creator_id) return row.creator_id;
   } catch {}
-
-  // 2) Fallback: nur telegram_id → jüngster Eintrag
+  // 2) Fallback: jüngster Eintrag nur via telegram_id
   try {
     const { data, error } = await supabaseAdmin
       .from("vip_users")
@@ -378,10 +385,13 @@ async function findCreatorIdForUser({ userId, chatId }) {
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/* Telegram Bootstrap                                                          */
+/* -------------------------------------------------------------------------- */
 async function bootstrapTelegram() {
   await setWebhookWithRetry(telegramWebhook, 5);
 
-  // /start – nutzt Deep-Link payload: /start cid_<creator_uuid>
+  // /start – nutzt Deep-Link payload
   bot.onText(/^\/start\b/i, async (msg) => {
     const chatId = msg.chat.id;
     const userId = String(msg.from.id);
