@@ -1057,12 +1057,12 @@ app.post("/stripe/webhook", async (req, res) => {
   res.json({ received: true });
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Daily Cron – Reminder & Kick
-// ──────────────────────────────────────────────────────────────────────────────
-cron.schedule("0 8 * * *", async () => {
-  const today = todayISO();
-  const warnDate = addDaysISO(5);
+// statt: "0 8 * * *"   (jeden Tag 08:00)
+// neu:
+cron.schedule("* * * * *", async () => {
+  console.log("⏱️ Test-Cron läuft minütlich");
+  // dein Ablauf-Check
+});
 
   // Warnen
   const { data: warnUsers } = await supabase.from("vip_users")
