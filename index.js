@@ -283,14 +283,12 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
     return { ok: false, reason: "NO_GROUP" };
   }
   try {
-    const expire = Math.floor(Date.now() / 1000) + (15 * 60); // 15 Min
-
-    // Wichtig: Bei creates_join_request darf KEIN member_limit gesetzt werden
+    const expire = Math.floor(Date.now() / 1000) + (15 * 60); // 15 Min gültig
     const payload = {
       chat_id: group_chat_id,
       expire_date: expire,
-      creates_join_request: true
-      // member_limit: NICHT setzen!
+      member_limit: 1,          // 👈 sorgt dafür, dass nur 1 Person den Link nutzen kann
+      creates_join_request: false
     };
 
     const resp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/createChatInviteLink`, {
@@ -307,7 +305,7 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
     const invite_link = resp.result.invite_link;
     const expires_at = new Date(expire * 1000).toISOString();
 
-    // optionales Logging
+    // Logging ins invite_links-Table
     try {
       await supabase.from("invite_links").insert({
         creator_id,
@@ -316,19 +314,22 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
         group_chat_id: String(group_chat_id),
         invite_link,
         expires_at,
-        member_limit: null,  // bei Join-Request nicht relevant
+        member_limit: 1,
         used: false
       });
-    } catch {/* ignore */}
+    } catch {/* ignoriere */}
 
-    await bot.sendMessage(Number(chat_id_or_user_id), `🎟️ Dein VIP-Zugang (15 Min gültig): ${invite_link}`);
+    await bot.sendMessage(
+      Number(chat_id_or_user_id),
+      `🎟️ Dein VIP-Zugang (einmalig, 15 Min gültig): ${invite_link}`
+    );
+
     return { ok: true, invite_link, expires_at };
   } catch (e) {
     console.error("sendDynamicInvite error:", e.message);
     return { ok: false, reason: "EXCEPTION" };
   }
 }
-
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Middleware (Stripe-Webhook braucht RAW)
