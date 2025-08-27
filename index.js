@@ -14,7 +14,7 @@ const {
   BASE_URL, // z.B. https://luxbasebot.onrender.com
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
-  SUPABASE_ANON_KEY,        // optional (wir lesen eh mit Service-Role)
+  SUPABASE_ANON_KEY,        // optional
   STRIPE_SECRET_KEY,        // optional
   STRIPE_WEBHOOK_SECRET,    // optional
   PORT = 3000
@@ -138,12 +138,7 @@ async function findValidInvite({ creator_id, group_chat_id, telegram_id, invite_
     row = await sbSelect(
       "invite_links",
       "*",
-      {
-        creator_id: String(creator_id),
-        group_chat_id: String(group_chat_id),
-        invite_link: String(invite_url),
-        used: false
-      },
+      { creator_id: String(creator_id), group_chat_id: String(group_chat_id), invite_link: String(invite_url), used: false },
       true
     ).catch(() => null);
   }
@@ -151,12 +146,7 @@ async function findValidInvite({ creator_id, group_chat_id, telegram_id, invite_
     row = await sbSelect(
       "invite_links",
       "*",
-      {
-        creator_id: String(creator_id),
-        group_chat_id: String(group_chat_id),
-        telegram_id: String(telegram_id),
-        used: false
-      },
+      { creator_id: String(creator_id), group_chat_id: String(group_chat_id), telegram_id: String(telegram_id), used: false },
       true
     ).catch(() => null);
   }
@@ -206,6 +196,36 @@ app.get("/stripe/ping", (_req, res) => {
 function logStripe(msg, extra = {}) {
   const time = new Date().toISOString();
   try { console.log(`[Stripe:${time}] ${msg}`, extra); } catch { console.log(`[Stripe:${time}] ${msg}`); }
+}
+
+/* -------------------------- Checkout Link Generator ------------------------ */
+/** Liefert eine URL, auf die wir redirecten können (Stripe Checkout oder Payment Link). */
+async function getCheckoutUrl({ creator_id, telegram_id }) {
+  const cfg = await getCreatorCfgById(creator_id);
+  // 1) Payment Link bevorzugen, wenn vorhanden
+  if (cfg?.stripe_payment_link && typeof cfg.stripe_payment_link === "string" && cfg.stripe_payment_link.startsWith("http")) {
+    // einige Payment-Link-Parameter können als Query mitgegeben werden
+    const url = new URL(cfg.stripe_payment_link);
+    url.searchParams.set("client_reference_id", String(telegram_id));
+    url.searchParams.set("prefilled_email", ""); // optional
+    return url.toString();
+  }
+  // 2) Checkout Session über price_id
+  if (stripe && cfg?.stripe_price_id) {
+    const mode = cfg?.stripe_mode === "subscription" ? "subscription" : "payment";
+    const session = await stripe.checkout.sessions.create({
+      mode,
+      line_items: [{ price: cfg.stripe_price_id, quantity: 1 }],
+      success_url: `${BASE_URL}/pay/success?cid=${creator_id}&tid=${telegram_id}`,
+      cancel_url: `${BASE_URL}/pay/cancel?cid=${creator_id}&tid=${telegram_id}`,
+      allow_promotion_codes: true,
+      metadata: { creator_id: String(creator_id), telegram_user_id: String(telegram_id) },
+      client_reference_id: String(telegram_id)
+    });
+    return session.url;
+  }
+  // 3) Keine Stripe-Konfig vorhanden
+  return null;
 }
 
 /* ------------------------------- Stripe Hook ------------------------------- */
@@ -284,6 +304,24 @@ app.post("/stripe/debug", bodyParser.json(), async (req, res) => {
   res.json({ ok: true });
 });
 
+/* -------------------------- Payment Redirect Routes ------------------------ */
+// erzeugt/ermittelt eine Checkout-URL und leitet hin
+app.get("/pay/:creator_id/:telegram_id", async (req, res) => {
+  try {
+    const { creator_id, telegram_id } = req.params;
+    const url = await getCheckoutUrl({ creator_id, telegram_id });
+    if (!url) {
+      return res.status(500).send("Kein Stripe-Setup gefunden (stripe_price_id oder stripe_payment_link fehlt).");
+    }
+    res.redirect(url);
+  } catch (e) {
+    console.error("/pay redirect error:", e);
+    res.status(500).send("Fehler beim Erstellen des Bezahlvorgangs.");
+  }
+});
+app.get("/pay/success", (_req, res) => res.send("✅ Zahlung erfolgreich. Du wirst in Kürze freigeschaltet."));
+app.get("/pay/cancel", (_req, res) => res.send("❌ Zahlung abgebrochen. Du kannst es jederzeit erneut versuchen."));
+
 /* ------------------------ JSON parser & Telegram hook ---------------------- */
 app.use(bodyParser.json());
 
@@ -297,7 +335,7 @@ app.post(telegramPath, (req, res) => {
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/health", (_req, res) => res.json({ ok: true, base_url: BASE_URL, supabase_url_present: !!SB_URL }));
 
-// 👉 Dashboard-Button „Bot verbinden“ kann diesen Endpoint aufrufen
+// 👉 Dashboard-Button „Bot verbinden“
 app.get("/api/bot/connect", async (_req, res) => {
   try {
     const ok = await setWebhookWithRetry(telegramWebhook, 5);
@@ -419,6 +457,13 @@ async function findCreatorIdForUser({ userId, chatId }) {
   }
 }
 
+/* ----------------------------- Pay-Button Helper --------------------------- */
+async function sendPayButton({ chatId, creator_id, telegram_id }) {
+  const url = `${BASE_URL}/pay/${creator_id}/${telegram_id}`;
+  const kb = { inline_keyboard: [[{ text: "💳 Jetzt zahlen", url }]] };
+  await bot.sendMessage(chatId, "Perfekt! 🎉 Sobald deine Zahlung eingegangen ist, geht es los.", { reply_markup: kb });
+}
+
 /* -------------------------------------------------------------------------- */
 /* Telegram Bootstrap                                                          */
 /* -------------------------------------------------------------------------- */
@@ -492,6 +537,8 @@ async function bootstrapTelegram() {
       if (data === "btn_age") {
         await sbAdminUpdate("vip_users", { alter_ok: true, letzter_kontakt: nowTS() }, { creator_id, telegram_id: userId });
         await bot.answerCallbackQuery(q.id, { text: "✅ Alter bestätigt!" });
+        // 👉 zusätzlich im Chat bestätigen
+        await bot.sendMessage(chatId, "🔞 Alter bestätigt.");
         return;
       }
 
@@ -506,7 +553,9 @@ async function bootstrapTelegram() {
       if (data === "btn_accept_rules") {
         await sbAdminUpdate("vip_users", { regeln_ok: true, letzter_kontakt: nowTS() }, { creator_id, telegram_id: userId });
         await bot.answerCallbackQuery(q.id, { text: "✅ Regeln akzeptiert!" });
-        await bot.sendMessage(chatId, "Perfekt! 🎉 Sobald deine Zahlung eingegangen ist, geht es los.");
+        // 👉 zusätzlich im Chat bestätigen + Pay-Button senden
+        await bot.sendMessage(chatId, "✅ Regeln akzeptiert.");
+        await sendPayButton({ chatId, creator_id, telegram_id: userId });
         return;
       }
 
