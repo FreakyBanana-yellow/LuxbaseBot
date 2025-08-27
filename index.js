@@ -1149,9 +1149,11 @@ async function runExpirySweep() {
   const warnDate = addDaysISO(5);
 
   // Reminder mit Verlängerungslink
-  const { data: warnUsers } = await supabase.from("vip_users")
-    .select("creator_id, telegram_id, chat_id, vip_bis")
-    .gte("vip_bis", today).lte("vip_bis", warnDate).eq("status", "aktiv");
+const { data: warnUsers } = await supabase.from("vip_users")
+  .select("creator_id, telegram_id, chat_id, vip_bis, creator_config(creator_name)")
+  .gte("vip_bis", today).lte("vip_bis", warnDate).eq("status", "aktiv")
+  .leftJoin("creator_config", "vip_users.creator_id", "creator_config.creator_id");
+
 
   for (const u of warnUsers || []) {
     try {
@@ -1161,7 +1163,8 @@ async function runExpirySweep() {
         chat_id: String(u.chat_id || u.telegram_id)
       });
 
-      const text = `⏰ Dein VIP läuft am ${u.vip_bis} ab.\nVerlängere rechtzeitig, um drin zu bleiben.`;
+      const modelName = u.creator_config?.creator_name || "dein Creator";
+      const text = `⏰ Dein VIP für *${modelName}* läuft am ${u.vip_bis} ab.\nVerlängere rechtzeitig, um drin zu bleiben.`;
       if (url) {
         await bot.sendMessage(Number(u.chat_id || u.telegram_id), text, {
           reply_markup: { inline_keyboard: [[{ text: "🔁 VIP jetzt verlängern", url }]] }
@@ -1205,10 +1208,11 @@ async function runExpirySweep() {
           .eq("creator_id", u.creator_id)
           .eq("telegram_id", u.telegram_id);
 
-        await bot.sendMessage(
-          Number(u.chat_id || u.telegram_id),
-          `❌ Dein VIP ist abgelaufen. Du wurdest aus der Gruppe entfernt.\nMit /start → „Jetzt bezahlen“ kannst du jederzeit verlängern.`
-        );
+      const modelName = u.creator_config?.creator_name || "dein Creator";
+await bot.sendMessage(
+  Number(u.chat_id || u.telegram_id),
+  `❌ Dein VIP für *${modelName}* ist abgelaufen. Du wurdest aus der Gruppe entfernt.\nMit /start → „Jetzt bezahlen“ kannst du jederzeit verlängern.`
+);
       } catch {}
     }
   }
