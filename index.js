@@ -947,115 +947,124 @@ app.post("/stripe/webhook", async (req, res) => {
   };
 
   if (event.type === "checkout.session.completed") {
-    const s = event.data.object;
+  const s = event.data.object;
 
-    let creator_id = s.metadata?.creator_id || null;
-    let telegram_id = s.metadata?.telegram_id || null;
-    let chat_id     = s.metadata?.chat_id || null;
-    let vipDaysMeta = s.metadata?.vip_days || null;
+  let creator_id = s.metadata?.creator_id || null;
+  let telegram_id = s.metadata?.telegram_id || null;
+  let chat_id     = s.metadata?.chat_id || null;
+  let vipDaysMeta = s.metadata?.vip_days || null;
 
-    if (!vipDaysMeta && s.subscription) {
-      const sub = await retrieveSub(s.subscription);
-      if (sub?.metadata) {
-        vipDaysMeta = vipDaysMeta || sub.metadata.vip_days;
-        creator_id  = creator_id  || sub.metadata.creator_id;
-        telegram_id = telegram_id || sub.metadata.telegram_id;
-        chat_id     = chat_id     || sub.metadata.chat_id;
-      }
+  if (!vipDaysMeta && s.subscription) {
+    const sub = await retrieveSub(s.subscription);
+    if (sub?.metadata) {
+      vipDaysMeta = vipDaysMeta || sub.metadata.vip_days;
+      creator_id  = creator_id  || sub.metadata.creator_id;
+      telegram_id = telegram_id || sub.metadata.telegram_id;
+      chat_id     = chat_id     || sub.metadata.chat_id;
     }
+  }
 
-    try {
-      const cfg = await getCreatorCfgById(creator_id);
-      const days = Number(vipDaysMeta ?? cfg?.vip_days ?? cfg?.vip_dauer ?? 30);
-      const vip_bis = addDaysISO(days);
+  try {
+    // ⬅️ Vorherigen VIP-Status abfragen, um zu erkennen ob es eine Verlängerung ist
+    const { data: prevVip } = await supabase
+      .from("vip_users")
+      .select("status, vip_bis")
+      .eq("creator_id", creator_id)
+      .eq("telegram_id", String(telegram_id))
+      .maybeSingle();
 
-      const resVip = await setVipStatus({
-        creator_id,
-        telegram_id,
-        chat_id,
-        status: "aktiv",
-        vip_bis,
-        letztes_event: "checkout.session.completed",
-        extra: { stripe_session_id: s.id, stripe_account: event.account || null }
-      });
+    const wasActive =
+      !!prevVip &&
+      prevVip.status === "aktiv" &&
+      (prevVip.vip_bis || "") >= todayISO();
 
-      const vipRow = resVip?.data;
+    const cfg   = await getCreatorCfgById(creator_id);
+    const days  = Number(vipDaysMeta ?? cfg?.vip_days ?? cfg?.vip_dauer ?? 30);
+    const vip_bis = addDaysISO(days);
 
+    // Persistenz
+    const resVip = await setVipStatus({
+      creator_id,
+      telegram_id,
+      chat_id,
+      status: "aktiv",
+      vip_bis,
+      letztes_event: "checkout.session.completed",
+      extra: { stripe_session_id: s.id, stripe_account: event.account || null }
+    });
+
+    const targetChat = Number(chat_id || telegram_id);
+
+    if (wasActive) {
+      // ✅ Erneuerung: nur Danke/Bestätigung, KEIN neuer Link
+      await bot.sendMessage(
+        targetChat,
+        `✅ Danke, deine VIP-Zeit wurde verlängert!\nNeues Ablaufdatum: ${vip_bis}`
+      );
+    } else {
+      // 🆕 Erstkauf: Welcome + Invite (wie zuvor)
       if (cfg?.welcome_text) {
-        await bot.sendMessage(Number(chat_id), escapeMDV2(cfg.welcome_text), { parse_mode: "MarkdownV2" });
+        await bot.sendMessage(targetChat, escapeMDV2(cfg.welcome_text), { parse_mode: "MarkdownV2" });
       }
 
       if (cfg?.group_chat_id) {
         const result = await sendDynamicInvitePerModel({
           creator_id,
           group_chat_id: cfg.group_chat_id,
-          chat_id_or_user_id: vipRow?.chat_id || chat_id
+          chat_id_or_user_id: resVip?.data?.chat_id || chat_id
         });
         if (!result.ok && cfg?.gruppe_link) {
-          await bot.sendMessage(Number(chat_id), `🔗 Fallback-Zugang: ${cfg.gruppe_link}`);
+          await bot.sendMessage(targetChat, `🔗 Fallback-Zugang: ${cfg.gruppe_link}`);
         } else if (!result.ok) {
-          await bot.sendMessage(Number(chat_id), "⚠️ Zugang aktuell nicht möglich. Bitte Support kontaktieren.");
+          await bot.sendMessage(targetChat, "⚠️ Zugang aktuell nicht möglich. Bitte Support kontaktieren.");
         }
       } else {
         if (cfg?.gruppe_link) {
-          await bot.sendMessage(Number(chat_id), `🔗 Dein VIP-Zugang: ${cfg.gruppe_link}`);
+          await bot.sendMessage(targetChat, `🔗 Dein VIP-Zugang: ${cfg.gruppe_link}`);
         } else {
-          await bot.sendMessage(Number(chat_id), "⚠️ Der Creator hat noch keine Gruppe verbunden.");
+          await bot.sendMessage(targetChat, "⚠️ Der Creator hat noch keine Gruppe verbunden.");
         }
       }
-    } catch (e) { console.error("Fulfill error:", e.message); }
-  }
-
-  if (event.type === "invoice.paid") {
-    const inv = event.data.object;
-    try {
-      const subId = inv.subscription;
-      if (!subId) return;
-      const subscription = await retrieveSub(subId);
-      const md = subscription?.metadata || {};
-      const creator_id = md.creator_id;
-      const telegram_id = md.telegram_id;
-      const chat_id = md.chat_id;
-      const vipDays = Number(md.vip_days || 30);
-      if (!creator_id || !telegram_id) return;
-
-      const vip_bis = addDaysISO(vipDays);
-
-      await setVipStatus({
-        creator_id,
-        telegram_id,
-        chat_id,
-        status: "aktiv",
-        vip_bis,
-        letztes_event: "invoice.paid",
-        extra: { invoice_id: inv.id, sub_id: subId }
-      });
-    } catch (e) {
-      console.error("invoice.paid handler error:", e.message);
     }
+  } catch (e) {
+    console.error("Fulfill error:", e.message);
   }
+}
+if (event.type === "invoice.paid") {
+  const inv = event.data.object;
+  try {
+    const subId = inv.subscription;
+    if (!subId) return;
 
-  if (event.type === "customer.subscription.deleted") {
-    const sub = event.data.object;
-    try {
-      const md = sub?.metadata || {};
-      const creator_id = md.creator_id;
-      const telegram_id = md.telegram_id;
-      if (!creator_id || !telegram_id) return;
+    const subscription = await retrieveSub(subId);
+    const md = subscription?.metadata || {};
+    const creator_id  = md.creator_id;
+    const telegram_id = md.telegram_id;
+    const chat_id     = md.chat_id;
+    const vipDays     = Number(md.vip_days || 30);
+    if (!creator_id || !telegram_id) return;
 
-      await setVipStatus({
-        creator_id,
-        telegram_id,
-        status: "gekündigt",
-        letztes_event: "customer.subscription.deleted"
-      });
-    } catch (e) {
-      console.error("subscription.deleted handler error:", e.message);
-    }
+    const vip_bis = addDaysISO(vipDays);
+
+    await setVipStatus({
+      creator_id,
+      telegram_id,
+      chat_id,
+      status: "aktiv",
+      vip_bis,
+      letztes_event: "invoice.paid",
+      extra: { invoice_id: inv.id, sub_id: subId }
+    });
+
+    // ✅ Immer kurze Danke/Bestätigungs-Message bei (Folge-)Rechnungen
+    await bot.sendMessage(
+      Number(chat_id || telegram_id),
+      `✅ Danke, deine VIP-Zeit wurde verlängert!\nNeues Ablaufdatum: ${vip_bis}`
+    );
+  } catch (e) {
+    console.error("invoice.paid handler error:", e.message);
   }
-
-  res.json({ received: true });
-});
+}
 // ──────────────────────────────────────────────────────────────────────────────
 // Renewal-Checkout-Link erzeugen (Stripe)
 // ──────────────────────────────────────────────────────────────────────────────
