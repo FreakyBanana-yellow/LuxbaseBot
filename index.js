@@ -275,7 +275,7 @@ async function isActiveVip(creator_id, telegram_id) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Dynamische Einladungen (jetzt mit Join-Request!)
+// Dynamische Einladungen (Join-Request ohne member_limit)
 // ──────────────────────────────────────────────────────────────────────────────
 async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or_user_id }) {
   if (!group_chat_id) {
@@ -284,25 +284,30 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
   }
   try {
     const expire = Math.floor(Date.now() / 1000) + (15 * 60); // 15 Min
+
+    // Wichtig: Bei creates_join_request darf KEIN member_limit gesetzt werden
+    const payload = {
+      chat_id: group_chat_id,
+      expire_date: expire,
+      creates_join_request: true
+      // member_limit: NICHT setzen!
+    };
+
     const resp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/createChatInviteLink`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: group_chat_id,
-        expire_date: expire,
-        member_limit: 1,
-        creates_join_request: true   // <— wichtig: Join-Request statt Direktbeitritt
-      }),
+      body: JSON.stringify(payload),
     }).then(r => r.json());
 
     if (!(resp?.ok && resp?.result?.invite_link)) {
       console.error("createChatInviteLink failed:", resp);
-      return { ok: false, reason: "TG_API" };
+      return { ok: false, reason: "TG_API", raw: resp };
     }
 
     const invite_link = resp.result.invite_link;
     const expires_at = new Date(expire * 1000).toISOString();
 
+    // optionales Logging
     try {
       await supabase.from("invite_links").insert({
         creator_id,
@@ -311,10 +316,10 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
         group_chat_id: String(group_chat_id),
         invite_link,
         expires_at,
-        member_limit: 1,
+        member_limit: null,  // bei Join-Request nicht relevant
         used: false
       });
-    } catch { /* optional logging */ }
+    } catch {/* ignore */}
 
     await bot.sendMessage(Number(chat_id_or_user_id), `🎟️ Dein VIP-Zugang (15 Min gültig): ${invite_link}`);
     return { ok: true, invite_link, expires_at };
@@ -323,6 +328,7 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
     return { ok: false, reason: "EXCEPTION" };
   }
 }
+
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Middleware (Stripe-Webhook braucht RAW)
