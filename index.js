@@ -178,8 +178,6 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 const telegramPath = `/bot${BOT_TOKEN}`;
 const telegramWebhook = `${BASE_URL}${telegramPath}`;
 
-const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
-
 /* ------------------------------ Webhook Retry ------------------------------ */
 async function setWebhookWithRetry(url, tries = 5) {
   for (let i = 0; i < tries; i++) {
@@ -195,28 +193,56 @@ async function setWebhookWithRetry(url, tries = 5) {
   return false;
 }
 
+/* ------------------------------- Stripe Setup ------------------------------ */
+const stripePresent = !!STRIPE_SECRET_KEY;
+const stripe = stripePresent ? new Stripe(STRIPE_SECRET_KEY) : null;
+console.log("[Stripe] present:", stripePresent, "| WH secret present:", !!STRIPE_WEBHOOK_SECRET);
+
+// Reachability/Debug
+app.get("/stripe/webhook", (_req, res) => res.status(405).send("Use POST for Stripe webhooks."));
+app.get("/stripe/ping", (_req, res) => {
+  res.json({ ok: true, url: "/stripe/webhook", hasStripeKey: !!STRIPE_SECRET_KEY, hasWebhookSecret: !!STRIPE_WEBHOOK_SECRET });
+});
+function logStripe(msg, extra = {}) {
+  const time = new Date().toISOString();
+  try { console.log(`[Stripe:${time}] ${msg}`, extra); } catch { console.log(`[Stripe:${time}] ${msg}`); }
+}
+
 /* ------------------------------- Stripe Hook ------------------------------- */
+/** WICHTIG: RAW Body VOR json() */
 app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
-  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.sendStatus(200);
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) {
+    logStripe("Webhook hit, aber Stripe nicht konfiguriert – noop 200.");
+    return res.sendStatus(200);
+  }
 
   let event;
   try {
     const sig = req.headers["stripe-signature"];
     event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    logStripe("Event constructed", { type: event.type, id: event.id });
   } catch (err) {
-    console.error("Stripe signature error:", err.message);
+    console.error("Stripe signature error:", err?.message || err);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  // Sofort 200 an Stripe zurück
+  res.json({ received: true });
+
+  // Business-Handling (nachgelagert)
   try {
     if (event.type === "invoice.payment_succeeded") {
       const invoice = event.data.object;
       const customerId = invoice.customer ? String(invoice.customer) : null;
+      logStripe("invoice.payment_succeeded", { customerId });
 
       if (customerId) {
         const row = await sbSelect("vip_users", "creator_id, telegram_id", { stripe_customer_id: customerId }, true);
         if (row?.creator_id && row?.telegram_id) {
           await extendMembership({ creator_id: row.creator_id, telegram_id: row.telegram_id, days: 30 });
+          logStripe("extended by invoice", { creator_id: row.creator_id, telegram_id: row.telegram_id });
+        } else {
+          logStripe("no vip_users match for customer", { customerId });
         }
       }
     }
@@ -226,6 +252,7 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
       const customerId = session.customer ? String(session.customer) : null;
       const telegramIdFromMeta = session?.metadata?.telegram_user_id ? String(session.metadata.telegram_user_id) : null;
       const creatorIdFromMeta  = session?.metadata?.creator_id || null;
+      logStripe("checkout.session.completed", { customerId, telegramIdFromMeta, creatorIdFromMeta });
 
       if (telegramIdFromMeta && creatorIdFromMeta) {
         await sbAdminUpsert("vip_users", {
@@ -235,19 +262,26 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
         }, { onConflict: "creator_id,telegram_id" });
 
         await extendMembership({ creator_id: creatorIdFromMeta, telegram_id: telegramIdFromMeta, days: 30 });
+        logStripe("extended by checkout + metadata", { creator_id: creatorIdFromMeta, telegram_id: telegramIdFromMeta });
       } else if (customerId) {
         const row = await sbSelect("vip_users", "creator_id, telegram_id", { stripe_customer_id: customerId }, true);
         if (row?.creator_id && row?.telegram_id) {
           await extendMembership({ creator_id: row.creator_id, telegram_id: row.telegram_id, days: 30 });
+          logStripe("extended by checkout + customerId lookup", { creator_id: row.creator_id, telegram_id: row.telegram_id });
+        } else {
+          logStripe("checkout: no match via customerId either", { customerId });
         }
       }
     }
-
-    res.json({ received: true });
   } catch (e) {
-    console.error("Stripe handler error", e);
-    res.status(500).json({ ok: false });
+    console.error("Stripe handler error (post-200):", e);
   }
+});
+
+// Optional: local debug ohne Signaturprüfung
+app.post("/stripe/debug", bodyParser.json(), async (req, res) => {
+  logStripe("DEBUG endpoint hit", { hasBody: !!req.body, keys: Object.keys(req.body || {}) });
+  res.json({ ok: true });
 });
 
 /* ------------------------ JSON parser & Telegram hook ---------------------- */
