@@ -69,14 +69,27 @@ function getMW(userId) {
   return modelWizard.get(k);
 }
 
-// Deep-Link Payload: /start cid_<uuid>
+// Deep-Link Payload: /start <payload>
+// Akzeptiert: cid_<uuid> | creator_<uuid> | <uuid> | (optional) base64url-encodet uuid
 function parseCreatorFromStart(text = "") {
-  const m = text.match(/^\/start\s+([^\s]+)$/i);
+  const m = text?.match(/^\/start(?:\s+(.+))?/i);
   if (!m) return null;
-  const payload = m[1];
-  const mCid = payload.match(/^cid_(.+)$/i);
-  return mCid ? mCid[1] : null;
+  const payload = (m[1] || "").trim();
+  if (!payload) return null;
+
+  // Varianten zulassen
+  if (/^cid_/i.test(payload))      return payload.slice(4);
+  if (/^creator_/i.test(payload))  return payload.slice(8);
+  if (/^[0-9a-f-]{36}$/i.test(payload)) return payload; // nackte UUID
+
+  // optional: base64url -> uuid
+  try {
+    const decoded = Buffer.from(payload, "base64url").toString("utf8").trim();
+    if (/^[0-9a-f-]{36}$/i.test(decoded)) return decoded;
+  } catch {}
+  return null;
 }
+
 
 // Flirty Welcome
 function buildWelcomeMessage(creator, firstName = "") {
