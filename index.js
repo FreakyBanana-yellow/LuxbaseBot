@@ -1142,11 +1142,36 @@ async function createRenewalCheckout({ creator_id, telegram_id, chat_id }) {
 // ──────────────────────────────────────────────────────────────────────────────
 // Daily Check – Reminder (mit Verlängerungslink) & Kick
 // ──────────────────────────────────────────────────────────────────────────────
-const CRON_EXPR = process.env.CRON_EXPR || "* * * * *"; // jeden Tag 08:00 Uhr
+// Cron sichtbar machen + validieren + sofort laufen lassen
+const CRON_EXPR = (process.env.CRON_EXPR && process.env.CRON_EXPR.trim()) || "* * * * *";
 
-async function runExpirySweep() {
-  const today = todayISO();
-  const warnDate = addDaysISO(5);
+console.log("[CRON] expr =", JSON.stringify(CRON_EXPR), "valid =", cron.validate(CRON_EXPR));
+
+const task = cron.schedule(
+  CRON_EXPR,
+  async () => {
+    try {
+      await runExpirySweep();
+      console.log("⏲️ expiry sweep done @", new Date().toISOString());
+    } catch (e) {
+      console.error("expiry sweep error:", e?.message || e);
+    }
+  },
+  { timezone: "Europe/Berlin", scheduled: true }
+);
+
+console.log("[CRON] status after schedule =", task.getStatus?.() || "scheduled");
+
+// Optional: einmal direkt beim Boot ausführen (hilft beim Testen)
+(async () => {
+  try {
+    console.log("[CRON] boot-run start");
+    await runExpirySweep();
+    console.log("[CRON] boot-run done");
+  } catch (e) {
+    console.error("[CRON] boot-run error:", e?.message || e);
+  }
+})();
 
   // 1) Nutzer laden, die in 5 Tagen ablaufen
   const { data: warnUsers, error: warnErr } = await supabase
