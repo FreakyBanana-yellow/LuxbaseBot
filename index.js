@@ -1069,82 +1069,121 @@ if (event.type === "invoice.paid") {
 res.sendStatus(200);   // <- ANTWORT SENDEN
 });                    // <- ROUTE SCHLIESSEN
 // ──────────────────────────────────────────────────────────────────────────────
-// Renewal-Checkout-Link erzeugen (Stripe)
+// Daily Check – Reminder (mit Verlängerungslink) & Kick
 // ──────────────────────────────────────────────────────────────────────────────
-async function createRenewalCheckout({ creator_id, telegram_id, chat_id }) {
-  if (!stripe) return null;
+async function runExpirySweep() {
+  const today = todayISO();
+  const warnDate = addDaysISO(5);
 
-  const creator = await getCreatorCfgById(creator_id);
-  if (!creator || !creator.preis) return null;
+  // 1) Nutzer laden, die in 5 Tagen ablaufen
+  const { data: warnUsers, error: warnErr } = await supabase
+    .from("vip_users")
+    .select("creator_id, telegram_id, chat_id, vip_bis")
+    .gte("vip_bis", today)
+    .lte("vip_bis", warnDate)
+    .eq("status", "aktiv");
 
-  const acct = creator.stripe_account_id;
-  if (!acct) return null;
+  if (warnErr) {
+    console.error("warnUsers query error:", warnErr.message);
+  }
 
-  try {
-    const account = await stripe.accounts.retrieve(acct);
-    const caps = account.capabilities || {};
-    const transfersActive = caps.transfers === "active";
-    const cardActive      = caps.card_payments === "active";
-    const payoutsEnabled  = !!account.payouts_enabled;
+  // 2) Creator-Namen für diese Nutzer laden
+  const warnCreatorIds = [...new Set((warnUsers || []).map(u => u.creator_id))];
+  const { data: warnCfgs } = warnCreatorIds.length
+    ? await supabase
+        .from("creator_config")
+        .select("creator_id, creator_name")
+        .in("creator_id", warnCreatorIds)
+    : { data: [] };
+  const warnNameMap = new Map((warnCfgs || []).map(c => [c.creator_id, c.creator_name]));
 
-    const amountCents = Math.max(0, Math.round(Number(creator.preis || 0) * 100));
-    const vipDays     = Number(creator.vip_days ?? creator.vip_dauer ?? 30);
-    const feePct      = creator.application_fee_pct != null ? Number(creator.application_fee_pct) : null;
-
-    const lineItem = {
-      quantity: 1,
-      price_data: {
-        currency: "eur",
-        unit_amount: amountCents,
-        recurring: { interval: "day", interval_count: vipDays },
-        product_data: { name: `VIP-Bot Zugang – ${String(creator_id).slice(0,8)}`, metadata: { creator_id } }
-      }
-    };
-
-    let session;
-    if (transfersActive && payoutsEnabled) {
-      session = await stripe.checkout.sessions.create({
-        mode: "subscription",
-        success_url: `${BASE_URL}/stripe/success`,
-        cancel_url:  `${BASE_URL}/stripe/cancel`,
-        allow_promotion_codes: true,
-        line_items: [lineItem],
-        subscription_data: {
-          transfer_data: { destination: acct },
-          ...(feePct != null ? { application_fee_percent: feePct } : {}),
-          metadata: { creator_id, telegram_id, chat_id: String(chat_id), vip_days: String(vipDays) }
-        },
-        metadata: { creator_id, telegram_id, chat_id: String(chat_id), vip_days: String(vipDays) }
+  // 3) Reminder mit Verlängerungslink
+  for (const u of warnUsers || []) {
+    try {
+      const url = await createRenewalCheckout({
+        creator_id: u.creator_id,
+        telegram_id: String(u.telegram_id),
+        chat_id: String(u.chat_id || u.telegram_id)
       });
-    } else if (cardActive) {
-      session = await stripe.checkout.sessions.create({
-        mode: "subscription",
-        success_url: `${BASE_URL}/stripe/success`,
-        cancel_url:  `${BASE_URL}/stripe/cancel`,
-        allow_promotion_codes: true,
-        line_items: [lineItem],
-        subscription_data: {
-          ...(feePct != null ? { application_fee_percent: feePct } : {}),
-          metadata: { creator_id, telegram_id, chat_id: String(chat_id), vip_days: String(vipDays) }
-        },
-        metadata: { creator_id, telegram_id, chat_id: String(chat_id), vip_days: String(vipDays) }
-      }, { stripeAccount: acct });
-    } else {
-      return null;
+      const modelName = warnNameMap.get(u.creator_id) || "dein Creator";
+      const text = `⏰ Dein VIP für *${modelName}* läuft am ${u.vip_bis} ab.\nVerlängere rechtzeitig, um drin zu bleiben.`;
+
+      if (url) {
+        await bot.sendMessage(Number(u.chat_id || u.telegram_id), text, {
+          reply_markup: { inline_keyboard: [[{ text: "🔁 VIP jetzt verlängern", url }]] },
+          parse_mode: "Markdown"
+        });
+      } else {
+        await bot.sendMessage(
+          Number(u.chat_id || u.telegram_id),
+          `${text}\n\nTipp: Nutze /start und klicke „Jetzt bezahlen“.`,
+          { parse_mode: "Markdown" }
+        );
+      }
+    } catch (e) {
+      console.error("warn send error:", e?.message || e);
     }
-    return session?.url || null;
-  } catch (e) {
-    console.error("createRenewalCheckout error:", e?.message || e);
-    return null;
+  }
+
+  // 4) Abgelaufene → kicken
+  const { data: expired, error: expErr } = await supabase
+    .from("vip_users")
+    .select("creator_id, telegram_id, chat_id, vip_bis")
+    .lt("vip_bis", today)
+    .eq("status", "aktiv");
+
+  if (expErr) {
+    console.error("expired query error:", expErr.message);
+    return;
+  }
+
+  if (expired?.length) {
+    // Creator-Config einmal holen (inkl. group_chat_id + creator_name)
+    const expiredCreatorIds = [...new Set(expired.map(u => u.creator_id))];
+    const { data: cfgs } = await supabase
+      .from("creator_config")
+      .select("creator_id, group_chat_id, creator_name")
+      .in("creator_id", expiredCreatorIds);
+
+    const groupMap = new Map((cfgs || []).map(c => [c.creator_id, c.group_chat_id]));
+    const nameMap  = new Map((cfgs || []).map(c => [c.creator_id, c.creator_name]));
+
+    for (const u of expired) {
+      const group = groupMap.get(u.creator_id);
+      if (!group) continue;
+      const modelName = nameMap.get(u.creator_id) || "dein Creator";
+
+      try {
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id) })
+        });
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id), only_if_banned: true })
+        });
+
+        await supabase.from("vip_users")
+          .update({ status: "abgelaufen" })
+          .eq("creator_id", u.creator_id)
+          .eq("telegram_id", u.telegram_id);
+
+        await bot.sendMessage(
+          Number(u.chat_id || u.telegram_id),
+          `❌ Dein VIP für *${modelName}* ist abgelaufen. Du wurdest aus der Gruppe entfernt.\nMit /start → „Jetzt bezahlen“ kannst du jederzeit verlängern.`,
+          { parse_mode: "Markdown" }
+        );
+      } catch (e) {
+        console.error("kick flow error:", e?.message || e);
+      }
+    }
   }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Daily Check – Reminder (mit Verlängerungslink) & Kick
-// ──────────────────────────────────────────────────────────────────────────────
 // Cron sichtbar machen + validieren + sofort laufen lassen
 const CRON_EXPR = (process.env.CRON_EXPR && process.env.CRON_EXPR.trim()) || "* * * * *";
-
 console.log("[CRON] expr =", JSON.stringify(CRON_EXPR), "valid =", cron.validate(CRON_EXPR));
 
 const task = cron.schedule(
