@@ -860,7 +860,7 @@ async function maybeOfferPay(creator_id, chatId, userId) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
- // Stripe Connect – Onboarding
+// Stripe Connect – Onboarding
 // ──────────────────────────────────────────────────────────────────────────────
 app.get("/api/stripe/connect-link", async (req, res) => {
   try {
@@ -947,127 +947,200 @@ app.post("/stripe/webhook", async (req, res) => {
   };
 
   if (event.type === "checkout.session.completed") {
-  const s = event.data.object;
+    const s = event.data.object;
 
-  let creator_id = s.metadata?.creator_id || null;
-  let telegram_id = s.metadata?.telegram_id || null;
-  let chat_id     = s.metadata?.chat_id || null;
-  let vipDaysMeta = s.metadata?.vip_days || null;
+    let creator_id = s.metadata?.creator_id || null;
+    let telegram_id = s.metadata?.telegram_id || null;
+    let chat_id     = s.metadata?.chat_id || null;
+    let vipDaysMeta = s.metadata?.vip_days || null;
 
-  if (!vipDaysMeta && s.subscription) {
-    const sub = await retrieveSub(s.subscription);
-    if (sub?.metadata) {
-      vipDaysMeta = vipDaysMeta || sub.metadata.vip_days;
-      creator_id  = creator_id  || sub.metadata.creator_id;
-      telegram_id = telegram_id || sub.metadata.telegram_id;
-      chat_id     = chat_id     || sub.metadata.chat_id;
+    if (!vipDaysMeta && s.subscription) {
+      const sub = await retrieveSub(s.subscription);
+      if (sub?.metadata) {
+        vipDaysMeta = vipDaysMeta || sub.metadata.vip_days;
+        creator_id  = creator_id  || sub.metadata.creator_id;
+        telegram_id = telegram_id || sub.metadata.telegram_id;
+        chat_id     = chat_id     || sub.metadata.chat_id;
+      }
+    }
+
+    try {
+      // ⬅️ Vorherigen VIP-Status abfragen, um zu erkennen ob es eine Verlängerung ist
+      const { data: prevVip } = await supabase
+        .from("vip_users")
+        .select("status, vip_bis")
+        .eq("creator_id", creator_id)
+        .eq("telegram_id", String(telegram_id))
+        .maybeSingle();
+
+      const wasActive =
+        !!prevVip &&
+        prevVip.status === "aktiv" &&
+        (prevVip.vip_bis || "") >= todayISO();
+
+      const cfg   = await getCreatorCfgById(creator_id);
+      const days  = Number(vipDaysMeta ?? cfg?.vip_days ?? cfg?.vip_dauer ?? 30);
+      const vip_bis = addDaysISO(days);
+
+      // Persistenz
+      const resVip = await setVipStatus({
+        creator_id,
+        telegram_id,
+        chat_id,
+        status: "aktiv",
+        vip_bis,
+        letztes_event: "checkout.session.completed",
+        extra: { stripe_session_id: s.id, stripe_account: event.account || null }
+      });
+
+      const targetChat = Number(chat_id || telegram_id);
+
+      if (wasActive) {
+        // ✅ Erneuerung: nur Danke/Bestätigung, KEIN neuer Link
+        await bot.sendMessage(
+          targetChat,
+          `✅ Danke, deine VIP-Zeit wurde verlängert!\nNeues Ablaufdatum: ${vip_bis}`
+        );
+      } else {
+        // 🆕 Erstkauf: Welcome + Invite (wie zuvor)
+        if (cfg?.welcome_text) {
+          await bot.sendMessage(targetChat, escapeMDV2(cfg.welcome_text), { parse_mode: "MarkdownV2" });
+        }
+
+        if (cfg?.group_chat_id) {
+          const result = await sendDynamicInvitePerModel({
+            creator_id,
+            group_chat_id: cfg.group_chat_id,
+            chat_id_or_user_id: resVip?.data?.chat_id || chat_id
+          });
+          if (!result.ok && cfg?.gruppe_link) {
+            await bot.sendMessage(targetChat, `🔗 Fallback-Zugang: ${cfg.gruppe_link}`);
+          } else if (!result.ok) {
+            await bot.sendMessage(targetChat, "⚠️ Zugang aktuell nicht möglich. Bitte Support kontaktieren.");
+          }
+        } else {
+          if (cfg?.gruppe_link) {
+            await bot.sendMessage(targetChat, `🔗 Dein VIP-Zugang: ${cfg.gruppe_link}`);
+          } else {
+            await bot.sendMessage(targetChat, "⚠️ Der Creator hat noch keine Gruppe verbunden.");
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Fulfill error:", e.message);
     }
   }
 
-  try {
-    // ⬅️ Vorherigen VIP-Status abfragen, um zu erkennen ob es eine Verlängerung ist
-    const { data: prevVip } = await supabase
-      .from("vip_users")
-      .select("status, vip_bis")
-      .eq("creator_id", creator_id)
-      .eq("telegram_id", String(telegram_id))
-      .maybeSingle();
+  if (event.type === "invoice.paid") {
+    const inv = event.data.object;
+    try {
+      const subId = inv.subscription;
+      if (!subId) return;
 
-    const wasActive =
-      !!prevVip &&
-      prevVip.status === "aktiv" &&
-      (prevVip.vip_bis || "") >= todayISO();
+      const subscription = await retrieveSub(subId);
+      const md = subscription?.metadata || {};
+      const creator_id  = md.creator_id;
+      const telegram_id = md.telegram_id;
+      const chat_id     = md.chat_id;
+      const vipDays     = Number(md.vip_days || 30);
+      if (!creator_id || !telegram_id) return;
 
-    const cfg   = await getCreatorCfgById(creator_id);
-    const days  = Number(vipDaysMeta ?? cfg?.vip_days ?? cfg?.vip_dauer ?? 30);
-    const vip_bis = addDaysISO(days);
+      const vip_bis = addDaysISO(vipDays);
 
-    // Persistenz
-    const resVip = await setVipStatus({
-      creator_id,
-      telegram_id,
-      chat_id,
-      status: "aktiv",
-      vip_bis,
-      letztes_event: "checkout.session.completed",
-      extra: { stripe_session_id: s.id, stripe_account: event.account || null }
-    });
+      await setVipStatus({
+        creator_id,
+        telegram_id,
+        chat_id,
+        status: "aktiv",
+        vip_bis,
+        letztes_event: "invoice.paid",
+        extra: { invoice_id: inv.id, sub_id: subId }
+      });
 
-    const targetChat = Number(chat_id || telegram_id);
-
-    if (wasActive) {
-      // ✅ Erneuerung: nur Danke/Bestätigung, KEIN neuer Link
+      // ✅ Immer kurze Danke/Bestätigungs-Message bei (Folge-)Rechnungen
       await bot.sendMessage(
-        targetChat,
+        Number(chat_id || telegram_id),
         `✅ Danke, deine VIP-Zeit wurde verlängert!\nNeues Ablaufdatum: ${vip_bis}`
       );
-    } else {
-      // 🆕 Erstkauf: Welcome + Invite (wie zuvor)
-      if (cfg?.welcome_text) {
-        await bot.sendMessage(targetChat, escapeMDV2(cfg.welcome_text), { parse_mode: "MarkdownV2" });
-      }
-
-      if (cfg?.group_chat_id) {
-        const result = await sendDynamicInvitePerModel({
-          creator_id,
-          group_chat_id: cfg.group_chat_id,
-          chat_id_or_user_id: resVip?.data?.chat_id || chat_id
-        });
-        if (!result.ok && cfg?.gruppe_link) {
-          await bot.sendMessage(targetChat, `🔗 Fallback-Zugang: ${cfg.gruppe_link}`);
-        } else if (!result.ok) {
-          await bot.sendMessage(targetChat, "⚠️ Zugang aktuell nicht möglich. Bitte Support kontaktieren.");
-        }
-      } else {
-        if (cfg?.gruppe_link) {
-          await bot.sendMessage(targetChat, `🔗 Dein VIP-Zugang: ${cfg.gruppe_link}`);
-        } else {
-          await bot.sendMessage(targetChat, "⚠️ Der Creator hat noch keine Gruppe verbunden.");
-        }
-      }
+    } catch (e) {
+      console.error("invoice.paid handler error:", e.message);
     }
-  } catch (e) {
-    console.error("Fulfill error:", e.message);
   }
-}
-if (event.type === "invoice.paid") {
-  const inv = event.data.object;
+
+  res.sendStatus(200);   // Antwort senden
+});                      // Route schließen
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Renewal-Checkout-Link erzeugen (Stripe)
+// ──────────────────────────────────────────────────────────────────────────────
+async function createRenewalCheckout({ creator_id, telegram_id, chat_id }) {
+  if (!stripe) return null;
+
+  const creator = await getCreatorCfgById(creator_id);
+  if (!creator || !creator.preis) return null;
+
+  const acct = creator.stripe_account_id;
+  if (!acct) return null;
+
   try {
-    const subId = inv.subscription;
-    if (!subId) return;
+    const account = await stripe.accounts.retrieve(acct);
+    const caps = account.capabilities || {};
+    const transfersActive = caps.transfers === "active";
+    const cardActive      = caps.card_payments === "active";
+    const payoutsEnabled  = !!account.payouts_enabled;
 
-    const subscription = await retrieveSub(subId);
-    const md = subscription?.metadata || {};
-    const creator_id  = md.creator_id;
-    const telegram_id = md.telegram_id;
-    const chat_id     = md.chat_id;
-    const vipDays     = Number(md.vip_days || 30);
-    if (!creator_id || !telegram_id) return;
+    const amountCents = Math.max(0, Math.round(Number(creator.preis || 0) * 100));
+    const vipDays     = Number(creator.vip_days ?? creator.vip_dauer ?? 30);
+    const feePct      = creator.application_fee_pct != null ? Number(creator.application_fee_pct) : null;
 
-    const vip_bis = addDaysISO(vipDays);
+    const lineItem = {
+      quantity: 1,
+      price_data: {
+        currency: "eur",
+        unit_amount: amountCents,
+        recurring: { interval: "day", interval_count: vipDays },
+        product_data: { name: `VIP-Bot Zugang – ${String(creator_id).slice(0,8)}`, metadata: { creator_id } }
+      }
+    };
 
-    await setVipStatus({
-      creator_id,
-      telegram_id,
-      chat_id,
-      status: "aktiv",
-      vip_bis,
-      letztes_event: "invoice.paid",
-      extra: { invoice_id: inv.id, sub_id: subId }
-    });
-
-    // ✅ Immer kurze Danke/Bestätigungs-Message bei (Folge-)Rechnungen
-    await bot.sendMessage(
-      Number(chat_id || telegram_id),
-      `✅ Danke, deine VIP-Zeit wurde verlängert!\nNeues Ablaufdatum: ${vip_bis}`
-    );
+    let session;
+    if (transfersActive && payoutsEnabled) {
+      session = await stripe.checkout.sessions.create({
+        mode: "subscription",
+        success_url: `${BASE_URL}/stripe/success`,
+        cancel_url:  `${BASE_URL}/stripe/cancel`,
+        allow_promotion_codes: true,
+        line_items: [lineItem],
+        subscription_data: {
+          transfer_data: { destination: acct },
+          ...(feePct != null ? { application_fee_percent: feePct } : {}),
+          metadata: { creator_id, telegram_id, chat_id: String(chat_id), vip_days: String(vipDays) }
+        },
+        metadata: { creator_id, telegram_id, chat_id: String(chat_id), vip_days: String(vipDays) }
+      });
+    } else if (cardActive) {
+      session = await stripe.checkout.sessions.create({
+        mode: "subscription",
+        success_url: `${BASE_URL}/stripe/success`,
+        cancel_url:  `${BASE_URL}/stripe/cancel`,
+        allow_promotion_codes: true,
+        line_items: [lineItem],
+        subscription_data: {
+          ...(feePct != null ? { application_fee_percent: feePct } : {}),
+          metadata: { creator_id, telegram_id, chat_id: String(chat_id), vip_days: String(vipDays) }
+        },
+        metadata: { creator_id, telegram_id, chat_id: String(chat_id), vip_days: String(vipDays) }
+      }, { stripeAccount: acct });
+    } else {
+      return null;
+    }
+    return session?.url || null;
   } catch (e) {
-    console.error("invoice.paid handler error:", e.message);
+    console.error("createRenewalCheckout error:", e?.message || e);
+    return null;
   }
 }
-  
-res.sendStatus(200);   // <- ANTWORT SENDEN
-});                    // <- ROUTE SCHLIESSEN
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Daily Check – Reminder (mit Verlängerungslink) & Kick
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1211,102 +1284,6 @@ console.log("[CRON] status after schedule =", task.getStatus?.() || "scheduled")
     console.error("[CRON] boot-run error:", e?.message || e);
   }
 })();
-
-  // 1) Nutzer laden, die in 5 Tagen ablaufen
-  const { data: warnUsers, error: warnErr } = await supabase
-    .from("vip_users")
-    .select("creator_id, telegram_id, chat_id, vip_bis")
-    .gte("vip_bis", today)
-    .lte("vip_bis", warnDate)
-    .eq("status", "aktiv");
-
-  // 2) Creator-Namen für diese Nutzer laden
-  const warnCreatorIds = [...new Set((warnUsers || []).map(u => u.creator_id))];
-  const { data: warnCfgs } = warnCreatorIds.length
-    ? await supabase.from("creator_config")
-        .select("creator_id, creator_name")
-        .in("creator_id", warnCreatorIds)
-    : { data: [] };
-  const warnNameMap = new Map((warnCfgs || []).map(c => [c.creator_id, c.creator_name]));
-
-  // 3) Reminder mit Verlängerungslink
-  for (const u of warnUsers || []) {
-    try {
-      const url = await createRenewalCheckout({
-        creator_id: u.creator_id,
-        telegram_id: String(u.telegram_id),
-        chat_id: String(u.chat_id || u.telegram_id)
-      });
-      const modelName = warnNameMap.get(u.creator_id) || "dein Creator";
-      const text = `⏰ Dein VIP für *${modelName}* läuft am ${u.vip_bis} ab.\nVerlängere rechtzeitig, um drin zu bleiben.`;
-
-      if (url) {
-        await bot.sendMessage(Number(u.chat_id || u.telegram_id), text, {
-          reply_markup: { inline_keyboard: [[{ text: "🔁 VIP jetzt verlängern", url }]] },
-          parse_mode: "Markdown"
-        });
-      } else {
-        await bot.sendMessage(
-          Number(u.chat_id || u.telegram_id),
-          `${text}\n\nTipp: Nutze /start und klicke „Jetzt bezahlen“.`,
-          { parse_mode: "Markdown" }
-        );
-      }
-    } catch (e) {
-      console.error("warn send error:", e?.message || e);
-    }
-  }
-
-  // 4) Abgelaufene → kicken
-  const { data: expired } = await supabase
-    .from("vip_users")
-    .select("creator_id, telegram_id, chat_id, vip_bis")
-    .lt("vip_bis", today)
-    .eq("status", "aktiv");
-
-  if (expired?.length) {
-    // Creator-Config einmal holen (inkl. group_chat_id + creator_name)
-    const expiredCreatorIds = [...new Set(expired.map(u => u.creator_id))];
-    const { data: cfgs } = await supabase
-      .from("creator_config")
-      .select("creator_id, group_chat_id, creator_name")
-      .in("creator_id", expiredCreatorIds);
-
-    const groupMap = new Map((cfgs || []).map(c => [c.creator_id, c.group_chat_id]));
-    const nameMap  = new Map((cfgs || []).map(c => [c.creator_id, c.creator_name]));
-
-    for (const u of expired) {
-      const group = groupMap.get(u.creator_id);
-      if (!group) continue;
-      const modelName = nameMap.get(u.creator_id) || "dein Creator";
-
-      try {
-        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id) })
-        });
-        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id), only_if_banned: true })
-        });
-
-        await supabase.from("vip_users")
-          .update({ status: "abgelaufen" })
-          .eq("creator_id", u.creator_id)
-          .eq("telegram_id", u.telegram_id);
-
-        await bot.sendMessage(
-          Number(u.chat_id || u.telegram_id),
-          `❌ Dein VIP für *${modelName}* ist abgelaufen. Du wurdest aus der Gruppe entfernt.\nMit /start → „Jetzt bezahlen“ kannst du jederzeit verlängern.`,
-          { parse_mode: "Markdown" }
-        );
-      } catch {}
-    }
-  }
-}
-
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Health
