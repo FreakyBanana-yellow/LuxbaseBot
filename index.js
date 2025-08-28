@@ -1256,7 +1256,7 @@ async function runExpirySweep() {
 }
 
 // Cron sichtbar machen + validieren + sofort laufen lassen
-const CRON_EXPR = (process.env.CRON_EXPR && process.env.CRON_EXPR.trim()) || "* * * * *";
+const CRON_EXPR = (process.env.CRON_EXPR && process.env.CRON_EXPR.trim()) || "0 8 * * *";
 console.log("[CRON] expr =", JSON.stringify(CRON_EXPR), "valid =", cron.validate(CRON_EXPR));
 
 const task = cron.schedule(
