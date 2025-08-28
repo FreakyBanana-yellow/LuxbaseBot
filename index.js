@@ -58,7 +58,7 @@ function getMW(userId) {
 
 // 🔥 Flirty Welcome aus welcome_text (+ ${first_name}) + Preis/Dauer + Confirm-Block (alles MDV2-escaped)
 function buildWelcomeMessage(creator, firstName = "") {
-  const price = Number(creator.preis || 0).toFixed(0);
+  const { display: priceDisplay } = parsePrice(creator.preis);
   const days  = Number(creator.vip_days ?? creator.vip_dauer ?? 30);
 
   const baseRaw =
@@ -71,7 +71,7 @@ Hier bekommst du meinen **privatesten VIP-Zugang** – nur die heißesten Inhalt
         .trim()
       );
 
-  const metaRaw = `\n\n💶 ${price} €  •  ⏳ ${days} Tage exklusiv`;
+  const metaRaw = `\n\n💶 ${priceDisplay}  •  ⏳ ${days} Tage exklusiv`;
   const confirmRaw =
 `\n\nBevor ich dich reinlasse, brauch ich nur dein Go:
 1) 🔞 Du bist wirklich 18+
@@ -152,7 +152,45 @@ async function saveCreatorVoiceCaption(telegramId, caption) {
   if (error) console.error("saveCreatorVoiceCaption error:", error.message);
   return !error;
 }
+// Preis-Parsing: akzeptiert "12,99", "12.99", "1.234,56", "€ 12,50", etc.
+function parsePrice(preisLike) {
+  if (preisLike == null) return { value: 0, cents: 0, display: "0 €" };
+  let raw = String(preisLike).trim();
 
+  // alles außer Ziffern, Komma, Punkt, Minus entfernen (Währungen/Spaces raus)
+  raw = raw.replace(/[^\d,.\-]/g, "");
+
+  // beide Trenner vorhanden → letzten als Dezimaltrenner behandeln
+  const hasComma = raw.includes(",");
+  const hasDot   = raw.includes(".");
+  if (hasComma && hasDot) {
+    const lastComma = raw.lastIndexOf(",");
+    const lastDot   = raw.lastIndexOf(".");
+    const decimalSep = lastComma > lastDot ? "," : ".";
+    // alle Gruppentrenner entfernen (der "andere" Trenner)
+    const groupSep = decimalSep === "," ? "." : ",";
+    raw = raw.split(groupSep).join("");
+    if (decimalSep === ",") raw = raw.replace(",", ".");
+  } else if (hasComma) {
+    // nur Komma → europäisches Dezimal
+    raw = raw.replace(",", ".");
+  } else {
+    // nur Punkt oder nur Ziffern → schon okay
+  }
+
+  const value = Number.parseFloat(raw);
+  const safe  = Number.isFinite(value) ? value : 0;
+  const cents = Math.max(0, Math.round(safe * 100));
+
+  // hübsche EUR-Anzeige (de-DE)
+  const display = new Intl.NumberFormat("de-DE", {
+    style: "currency",
+    currency: "EUR",
+    maximumFractionDigits: 2
+  }).format(safe);
+
+  return { value: safe, cents, display };
+}
 // ──────────────────────────────────────────────────────────────────────────────
 // Robuste VIP-Persistenz (Retries, Dead-Letter, Admin-Alert)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -589,6 +627,7 @@ async function bootstrapTelegram() {
 
     // Flirty Welcome (MDV2-escaped)
     const text = buildWelcomeMessage(creator, msg.from.first_name || "");
+   
     const kb = {
       inline_keyboard: [
         [{ text: "🔞 Ich bin 18+", callback_data: `consent_age:${creator_id}` }],
@@ -698,7 +737,7 @@ async function bootstrapTelegram() {
         const cardActive      = caps.card_payments === "active";
         const payoutsEnabled  = !!account.payouts_enabled;
 
-        const amountCents = Math.max(0, Math.round(Number(creator.preis || 0) * 100));
+        const { cents: amountCents } = parsePrice(creator.preis);
         const vipDays = Number(creator.vip_days ?? creator.vip_dauer ?? 30);
         const feePct  = creator.application_fee_pct != null ? Number(creator.application_fee_pct) : null;
 
@@ -1089,7 +1128,7 @@ async function createRenewalCheckout({ creator_id, telegram_id, chat_id }) {
     const cardActive      = caps.card_payments === "active";
     const payoutsEnabled  = !!account.payouts_enabled;
 
-    const amountCents = Math.max(0, Math.round(Number(creator.preis || 0) * 100));
+    const { cents: amountCents } = parsePrice(creator.preis);
     const vipDays     = Number(creator.vip_days ?? creator.vip_dauer ?? 30);
     const feePct      = creator.application_fee_pct != null ? Number(creator.application_fee_pct) : null;
 
