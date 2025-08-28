@@ -1148,13 +1148,24 @@ async function runExpirySweep() {
   const today = todayISO();
   const warnDate = addDaysISO(5);
 
-  // Reminder mit Verlängerungslink
-const { data: warnUsers } = await supabase.from("vip_users")
-  .select("creator_id, telegram_id, chat_id, vip_bis, creator_config(creator_name)")
-  .gte("vip_bis", today).lte("vip_bis", warnDate).eq("status", "aktiv")
-  .leftJoin("creator_config", "vip_users.creator_id", "creator_config.creator_id");
+  // 1) Nutzer laden, die in 5 Tagen ablaufen
+  const { data: warnUsers, error: warnErr } = await supabase
+    .from("vip_users")
+    .select("creator_id, telegram_id, chat_id, vip_bis")
+    .gte("vip_bis", today)
+    .lte("vip_bis", warnDate)
+    .eq("status", "aktiv");
 
+  // 2) Creator-Namen für diese Nutzer laden
+  const warnCreatorIds = [...new Set((warnUsers || []).map(u => u.creator_id))];
+  const { data: warnCfgs } = warnCreatorIds.length
+    ? await supabase.from("creator_config")
+        .select("creator_id, creator_name")
+        .in("creator_id", warnCreatorIds)
+    : { data: [] };
+  const warnNameMap = new Map((warnCfgs || []).map(c => [c.creator_id, c.creator_name]));
 
+  // 3) Reminder mit Verlängerungslink
   for (const u of warnUsers || []) {
     try {
       const url = await createRenewalCheckout({
@@ -1162,16 +1173,19 @@ const { data: warnUsers } = await supabase.from("vip_users")
         telegram_id: String(u.telegram_id),
         chat_id: String(u.chat_id || u.telegram_id)
       });
-
-      const modelName = u.creator_config?.creator_name || "dein Creator";
+      const modelName = warnNameMap.get(u.creator_id) || "dein Creator";
       const text = `⏰ Dein VIP für *${modelName}* läuft am ${u.vip_bis} ab.\nVerlängere rechtzeitig, um drin zu bleiben.`;
+
       if (url) {
         await bot.sendMessage(Number(u.chat_id || u.telegram_id), text, {
-          reply_markup: { inline_keyboard: [[{ text: "🔁 VIP jetzt verlängern", url }]] }
+          reply_markup: { inline_keyboard: [[{ text: "🔁 VIP jetzt verlängern", url }]] },
+          parse_mode: "Markdown"
         });
       } else {
-        await bot.sendMessage(Number(u.chat_id || u.telegram_id),
-          `${text}\n\nTipp: Nutze /start und klicke „Jetzt bezahlen“.`
+        await bot.sendMessage(
+          Number(u.chat_id || u.telegram_id),
+          `${text}\n\nTipp: Nutze /start und klicke „Jetzt bezahlen“.`,
+          { parse_mode: "Markdown" }
         );
       }
     } catch (e) {
@@ -1179,18 +1193,29 @@ const { data: warnUsers } = await supabase.from("vip_users")
     }
   }
 
-  // Abgelaufene → kicken
-  const { data: expired } = await supabase.from("vip_users")
+  // 4) Abgelaufene → kicken
+  const { data: expired } = await supabase
+    .from("vip_users")
     .select("creator_id, telegram_id, chat_id, vip_bis")
-    .lt("vip_bis", today).eq("status", "aktiv");
+    .lt("vip_bis", today)
+    .eq("status", "aktiv");
 
   if (expired?.length) {
-    const { data: cfgs } = await supabase.from("creator_config").select("creator_id, group_chat_id");
-    const map = new Map((cfgs || []).map(c => [c.creator_id, c.group_chat_id]));
+    // Creator-Config einmal holen (inkl. group_chat_id + creator_name)
+    const expiredCreatorIds = [...new Set(expired.map(u => u.creator_id))];
+    const { data: cfgs } = await supabase
+      .from("creator_config")
+      .select("creator_id, group_chat_id, creator_name")
+      .in("creator_id", expiredCreatorIds);
+
+    const groupMap = new Map((cfgs || []).map(c => [c.creator_id, c.group_chat_id]));
+    const nameMap  = new Map((cfgs || []).map(c => [c.creator_id, c.creator_name]));
 
     for (const u of expired) {
-      const group = map.get(u.creator_id);
+      const group = groupMap.get(u.creator_id);
       if (!group) continue;
+      const modelName = nameMap.get(u.creator_id) || "dein Creator";
+
       try {
         await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`, {
           method: "POST",
@@ -1208,24 +1233,16 @@ const { data: warnUsers } = await supabase.from("vip_users")
           .eq("creator_id", u.creator_id)
           .eq("telegram_id", u.telegram_id);
 
-      const modelName = u.creator_config?.creator_name || "dein Creator";
-await bot.sendMessage(
-  Number(u.chat_id || u.telegram_id),
-  `❌ Dein VIP für *${modelName}* ist abgelaufen. Du wurdest aus der Gruppe entfernt.\nMit /start → „Jetzt bezahlen“ kannst du jederzeit verlängern.`
-);
+        await bot.sendMessage(
+          Number(u.chat_id || u.telegram_id),
+          `❌ Dein VIP für *${modelName}* ist abgelaufen. Du wurdest aus der Gruppe entfernt.\nMit /start → „Jetzt bezahlen“ kannst du jederzeit verlängern.`,
+          { parse_mode: "Markdown" }
+        );
       } catch {}
     }
   }
 }
 
-cron.schedule(CRON_EXPR, async () => {
-  try {
-    await runExpirySweep();
-    console.log("⏲️ expiry sweep done");
-  } catch (e) {
-    console.error("expiry sweep error:", e?.message || e);
-  }
-});
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Health
