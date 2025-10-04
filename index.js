@@ -391,8 +391,9 @@ app.post(telegramPath, (req, res) => {
   try { bot.processUpdate(req.body); } catch (err) { console.error("processUpdate error:", err); }
   res.sendStatus(200);
 });
-// Holt das Profilbild aus creator_config und sendet es in den Chat (falls vorhanden)
-async function sendCreatorProfileIfAny(creator_id, chat_id) {
+// Schickt das Creator-Profilbild als ganz normales Foto in den Chat.
+// Robuste Variante: zuerst URL direkt; wenn das scheitert -> Download + Buffer Upload.
+async function sendCreatorProfilePlain(creator_id, chat_id) {
   try {
     const { data, error } = await supabase
       .from("creator_config")
@@ -400,18 +401,33 @@ async function sendCreatorProfileIfAny(creator_id, chat_id) {
       .eq("creator_id", creator_id)
       .maybeSingle();
 
-    if (error) {
-      console.error("sendCreatorProfileIfAny fetch error:", error.message);
-      return false;
-    }
+    if (error) { console.error("profile fetch error:", error.message); return false; }
     const url = data?.profile_image_url;
     if (!url) return false;
 
     const caption = data?.creator_name ? `⭐ ${data.creator_name}` : undefined;
-    await bot.sendPhoto(Number(chat_id), url, caption ? { caption } : undefined);
+
+    // 1) Direkt mit URL versuchen
+    try {
+      await bot.sendPhoto(Number(chat_id), url, caption ? { caption } : undefined);
+      return true;
+    } catch (e) {
+      console.warn("sendPhoto via URL failed, try buffer:", e?.message || e);
+    }
+
+    // 2) Fallback: Datei laden und als Buffer hochladen (sicher gegen URL-Policies/CDN)
+    const resp = await fetch(url);
+    if (!resp.ok) { console.error("image fetch failed:", resp.status, url); return false; }
+    const contentType = resp.headers.get("content-type") || "image/jpeg";
+    const ab = await resp.arrayBuffer();
+    const buf = Buffer.from(ab);
+
+    // node-telegram-bot-api: 4.0+ akzeptiert Buffer mit fileOptions { filename, contentType }
+    const fileOptions = { filename: "creator_profile.jpg", contentType };
+    await bot.sendPhoto(Number(chat_id), buf, caption ? { caption } : undefined, fileOptions);
     return true;
   } catch (e) {
-    console.error("sendCreatorProfileIfAny error:", e?.message || e);
+    console.error("sendCreatorProfilePlain error:", e?.message || e);
     return false;
   }
 }
