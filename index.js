@@ -1,4 +1,4 @@
-// index.js – Luxbot @ Render (Telegram + Stripe Connect + Supabase + Voice-Intro + Flirty Welcome + Robust VIP Persistenz + Join-Guard + Short Pay Links + DM-Only Flow)
+// index.js – Luxbot @ Render (Telegram + Stripe Connect + Supabase + Voice-Intro + Flirty Welcome + Robust VIP Persistenz + Join-Guard + Instant Checkout)
 import express from "express";
 import dotenv from "dotenv";
 import TelegramBot from "node-telegram-bot-api";
@@ -89,7 +89,6 @@ async function getCreatorCfgById(creator_id) {
     .from("creator_config")
     .select(`
       creator_id,
-      creator_name,
       preis,
       vip_days,
       vip_dauer,
@@ -102,9 +101,7 @@ async function getCreatorCfgById(creator_id) {
       regeln_text,
       voice_enabled,
       voice_file_id,
-      voice_caption,
-      voice_updated_at,
-      profile_image_url
+      voice_caption
     `)
     .eq("creator_id", creator_id)
     .maybeSingle();
@@ -373,89 +370,6 @@ async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Short Pay Links (schöner Stripe-Redirect)
-// ──────────────────────────────────────────────────────────────────────────────
-const shortPay = new Map(); // token -> session.url
-function makeToken(len = 10) {
-  const a = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  return Array.from({ length: len }, () => a[Math.floor(Math.random()*a.length)]).join("");
-}
-
-app.get("/pay/:token", (req, res) => {
-  const t = req.params.token;
-  const url = shortPay.get(t);
-  if (!url) return res.status(404).send("Link abgelaufen oder ungültig.");
-  return res.redirect(302, url);
-});
-
-async function createShortCheckoutLink({ creatorForPay, userId, chatId }) {
-  const creator = await getCreatorCfgById(creatorForPay);
-  if (!creator) throw new Error("Konfiguration fehlt.");
-  if (!stripe)  throw new Error("Stripe nicht konfiguriert.");
-  const acct = creator.stripe_account_id;
-  if (!acct)   throw new Error("Stripe nicht verbunden.");
-
-  const account = await stripe.accounts.retrieve(acct);
-  const caps = account.capabilities || {};
-  const transfersActive = caps.transfers === "active";
-  const cardActive      = caps.card_payments === "active";
-  const payoutsEnabled  = !!account.payouts_enabled;
-
-  const { cents: amountCents } = parsePrice(creator.preis);
-  const vipDays = Number(creator.vip_days ?? creator.vip_dauer ?? 30);
-  const feePct  = creator.application_fee_pct != null ? Number(creator.application_fee_pct) : null;
-
-  const lineItem = {
-    quantity: 1,
-    price_data: {
-      currency: "eur",
-      unit_amount: amountCents,
-      recurring: { interval: "day", interval_count: vipDays },
-      product_data: { name: `VIP-Bot Zugang – ${creatorForPay.slice(0,8)}`, metadata: { creator_id: creatorForPay } }
-    }
-  };
-
-  let session;
-  if (transfersActive && payoutsEnabled) {
-    session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      success_url: `${BASE_URL}/stripe/success`,
-      cancel_url:  `${BASE_URL}/stripe/cancel`,
-      allow_promotion_codes: true,
-      line_items: [lineItem],
-      subscription_data: {
-        transfer_data: { destination: acct },
-        ...(feePct != null ? { application_fee_percent: feePct } : {}),
-        metadata: { creator_id: creatorForPay, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
-      },
-      metadata: { creator_id: creatorForPay, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
-    });
-  } else if (cardActive) {
-    session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      success_url: `${BASE_URL}/stripe/success`,
-      cancel_url:  `${BASE_URL}/stripe/cancel`,
-      allow_promotion_codes: true,
-      line_items: [lineItem],
-      subscription_data: {
-        ...(feePct != null ? { application_fee_percent: feePct } : {}),
-        metadata: { creator_id: creatorForPay, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
-      },
-      metadata: { creator_id: creatorForPay, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
-    }, { stripeAccount: acct });
-  } else {
-    throw new Error("Stripe-Onboarding unvollständig.");
-  }
-
-  const token = makeToken(11);
-  shortPay.set(token, session.url);
-  // auto-expire nach 30 Min
-  setTimeout(() => shortPay.delete(token), 30 * 60 * 1000);
-
-  return `${BASE_URL}/pay/${token}`;
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // Middleware (Stripe-Webhook braucht RAW)
 // ──────────────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -491,7 +405,7 @@ async function bootstrapTelegram() {
     console.error("❌ bootstrapTelegram error:", err.message);
   }
 
-  // Auto-Bind beim Hinzufügen in Gruppe (für Creator-Hauptgruppe)
+  // Auto-Bind beim Hinzufügen in Gruppe
   bot.on("my_chat_member", async (upd) => {
     const chat = upd.chat;
     const me = upd.new_chat_member;
@@ -623,7 +537,7 @@ async function bootstrapTelegram() {
     // Admin: /start link_creator_<uuid>
     const adminLink = /^link_creator_([A-Za-z0-9-]+)$/i.exec(raw);
 
-    // In Gruppe: Payload bevorzugt, sonst Auto-Bind (nur für Creator-Hauptgruppe; Käufer-Flow läuft DM-only)
+    // In Gruppe: Payload bevorzugt, sonst Auto-Bind
     if (msg.chat.type === "group" || msg.chat.type === "supergroup") {
       try {
         if (creator_id) {
@@ -677,7 +591,7 @@ async function bootstrapTelegram() {
       return;
     }
 
-    // Käufer-Flow (DM) – DM-ONLY
+    // Käufer-Flow (DM)
     if (!creator_id) {
       await bot.sendMessage(msg.chat.id, "❌ Ungültiger Start-Link.\nÖffne den Link direkt aus den VIP-Einstellungen (er enthält eine Kennung).");
       return;
@@ -685,15 +599,6 @@ async function bootstrapTelegram() {
 
     const creator = await getCreatorCfgById(creator_id);
     if (!creator) { await bot.sendMessage(msg.chat.id, "❌ Creator-Konfiguration nicht gefunden."); return; }
-
-    // 🔹 Profilbild (falls vorhanden) direkt im DM zeigen (vor Voice)
-    if (creator?.profile_image_url && msg.chat.type === "private") {
-      try {
-        await bot.sendPhoto(msg.chat.id, creator.profile_image_url, {
-          caption: creator?.creator_name ? `✨ ${creator.creator_name}` : undefined
-        });
-      } catch (e) { console.error("sendPhoto /start error:", e.message); }
-    }
 
     // Voice-Intro (falls vorhanden) direkt vorspielen
     if (creator?.voice_enabled && creator?.voice_file_id && msg.chat.type === "private") {
@@ -712,8 +617,8 @@ async function bootstrapTelegram() {
       chat_id: String(msg.chat.id),
       status: "gestartet",
       username: msg.from.username || null,
-      letztes_event: "start_clicked_dm",
-      extra: { source: "telegram_start_dm", chat_type: msg.chat.type }
+      letztes_event: "start_clicked",
+      extra: { source: "telegram_start", chat_type: msg.chat.type }
     });
 
     // Consent-State initialisieren
@@ -722,7 +627,7 @@ async function bootstrapTelegram() {
 
     // Flirty Welcome (MDV2-escaped)
     const text = buildWelcomeMessage(creator, msg.from.first_name || "");
-
+   
     const kb = {
       inline_keyboard: [
         [{ text: "🔞 Ich bin 18+", callback_data: `consent_age:${creator_id}` }],
@@ -733,7 +638,98 @@ async function bootstrapTelegram() {
     await bot.sendMessage(msg.chat.id, text, { reply_markup: kb, parse_mode: "MarkdownV2" });
   });
 
-  // Callback-Handler (inkl. Voice-Test/Caption)
+  // ── Instant-Checkout Helper ─────────────────────────────────────────────────
+  async function startCheckout(creatorForPay, chatId, userId) {
+    try {
+      if (!stripe) {
+        await bot.sendMessage(chatId, "⚠️ Stripe nicht konfiguriert.");
+        return;
+      }
+
+      const creator = await getCreatorCfgById(creatorForPay);
+      if (!creator) {
+        await bot.sendMessage(chatId, "⚠️ Konfiguration fehlt.");
+        return;
+      }
+
+      const acct = creator.stripe_account_id;
+      if (!acct) {
+        await bot.sendMessage(chatId, "⚠️ Stripe ist für diesen Creator noch nicht verbunden.");
+        return;
+      }
+
+      const account = await stripe.accounts.retrieve(acct);
+      const caps = account.capabilities || {};
+      const transfersActive = caps.transfers === "active";
+      const cardActive      = caps.card_payments === "active";
+      const payoutsEnabled  = !!account.payouts_enabled;
+
+      const { cents: amountCents } = parsePrice(creator.preis);
+      const vipDays = Number(creator.vip_days ?? creator.vip_dauer ?? 30);
+      const feePct  = creator.application_fee_pct != null ? Number(creator.application_fee_pct) : null;
+
+      const lineItem = {
+        quantity: 1,
+        price_data: {
+          currency: "eur",
+          unit_amount: amountCents,
+          recurring: { interval: "day", interval_count: vipDays },
+          product_data: {
+            name: `VIP-Bot Zugang – ${String(creatorForPay).slice(0,8)}`,
+            metadata: { creator_id: creatorForPay }
+          }
+        }
+      };
+
+      let session;
+      if (transfersActive && payoutsEnabled) {
+        session = await stripe.checkout.sessions.create({
+          mode: "subscription",
+          success_url: `${BASE_URL}/stripe/success`,
+          cancel_url:  `${BASE_URL}/stripe/cancel`,
+          allow_promotion_codes: true,
+          line_items: [lineItem],
+          subscription_data: {
+            transfer_data: { destination: acct },
+            ...(feePct != null ? { application_fee_percent: feePct } : {}),
+            metadata: { creator_id: creatorForPay, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
+          },
+          metadata: { creator_id: creatorForPay, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
+        });
+      } else if (cardActive) {
+        session = await stripe.checkout.sessions.create({
+          mode: "subscription",
+          success_url: `${BASE_URL}/stripe/success`,
+          cancel_url:  `${BASE_URL}/stripe/cancel`,
+          allow_promotion_codes: true,
+          line_items: [lineItem],
+          subscription_data: {
+            ...(feePct != null ? { application_fee_percent: feePct } : {}),
+            metadata: { creator_id: creatorForPay, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
+          },
+          metadata: { creator_id: creatorForPay, telegram_id: userId, chat_id: String(chatId), vip_days: String(vipDays) }
+        }, { stripeAccount: acct });
+      } else {
+        const link = await stripe.accountLinks.create({
+          account: acct, type: "account_onboarding",
+          refresh_url: `${BASE_URL}/stripe/connect/refresh?creator_id=${encodeURIComponent(creatorForPay)}`,
+          return_url:  `${BASE_URL}/stripe/connect/return?creator_id=${encodeURIComponent(creatorForPay)}`
+        });
+        await bot.sendMessage(chatId, `⚠️ Bitte Stripe-Onboarding abschließen:\n${link.url}`);
+        return;
+      }
+
+      // Genau EIN Payment-Post
+      await bot.sendMessage(Number(chatId), "🧾 Öffne den Zahlungsdialog:", {
+        reply_markup: { inline_keyboard: [[{ text: "💳 Jetzt bezahlen", url: session.url }]] }
+      });
+    } catch (e) {
+      console.error("startCheckout error:", e?.message || e);
+      await bot.sendMessage(Number(chatId), "⚠️ Es gab ein Problem beim Starten der Zahlung. Bitte später erneut versuchen.");
+    }
+  }
+
+  // Callback-Handler (inkl. Voice-Test/Caption & Instant-Checkout)
   bot.on("callback_query", async (q) => {
     const chatId = q.message?.chat?.id;
     const userId = String(q.from.id);
@@ -765,7 +761,7 @@ async function bootstrapTelegram() {
       return;
     }
 
-    // Consent / Pay
+    // Consent State Helper
     const getState = (creator_id) => {
       const key = `${creator_id}:${userId}`;
       if (!consentState.has(key)) consentState.set(key, { age: false, rules: false });
@@ -777,7 +773,12 @@ async function bootstrapTelegram() {
       const { key, state } = getState(creator_id);
       state.age = true; consentState.set(key, state);
       await bot.answerCallbackQuery(q.id, { text: "Altersbestätigung gespeichert." });
-      await maybeOfferPay(creator_id, chatId, userId);
+
+      if (state.age && state.rules) {
+        await startCheckout(creator_id, chatId, userId);
+      } else {
+        await bot.sendMessage(chatId, "Noch offen: 📜 Regeln akzeptieren");
+      }
       return;
     }
 
@@ -795,11 +796,16 @@ async function bootstrapTelegram() {
       const { key, state } = getState(creator_id);
       state.rules = true; consentState.set(key, state);
       await bot.answerCallbackQuery(q.id, { text: "Regeln akzeptiert." });
-      await maybeOfferPay(creator_id, chatId, userId);
+
+      if (state.age && state.rules) {
+        await startCheckout(creator_id, chatId, userId);
+      } else {
+        await bot.sendMessage(chatId, "Noch offen: 🔞 Alterscheck");
+      }
       return;
     }
 
-    // Payment starten – jetzt mit Short-URL
+    // Pay-Now Fallback (falls Buttons anderswo noch existieren)
     if (data.startsWith("pay_now")) {
       const parts = data.split(":");
       let creatorForPay = parts[1];
@@ -813,17 +819,8 @@ async function bootstrapTelegram() {
 
       if (!creatorForPay) { await bot.answerCallbackQuery(q.id, { text: "Bitte zuerst /start über den VIP-Link nutzen." }); return; }
 
-      try {
-        const shortUrl = await createShortCheckoutLink({ creatorForPay, userId, chatId });
-        await bot.answerCallbackQuery(q.id, { text: "Weiter zur Zahlung…" });
-        await bot.sendMessage(chatId, "💳 Öffne den Zahlungsdialog:", {
-          reply_markup: { inline_keyboard: [[{ text: "Jetzt bezahlen", url: shortUrl }]] }
-        });
-      } catch (e) {
-        console.error("createShortCheckoutLink error:", e?.message || e);
-        await bot.answerCallbackQuery(q.id, { text: "Zahlung derzeit nicht möglich." });
-        await bot.sendMessage(chatId, "⚠️ Zahlung derzeit nicht möglich. Bitte prüfe Stripe-Setup und versuche es später erneut.");
-      }
+      await bot.answerCallbackQuery(q.id, { text: "Öffne den Zahlungsdialog…" });
+      await startCheckout(creatorForPay, chatId, userId);
       return;
     }
   });
@@ -914,15 +911,21 @@ async function bootstrapTelegram() {
   });
 }
 
+// maybeOfferPay bleibt als Wrapper erhalten (optional)
 async function maybeOfferPay(creator_id, chatId, userId) {
   const key = `${creator_id}:${userId}`;
   const s = consentState.get(key) || { age: false, rules: false };
   if (s.age && s.rules) {
-    await bot.sendMessage(Number(chatId), "Alles klar – du kannst jetzt bezahlen.", {
-      reply_markup: { inline_keyboard: [[{ text: "💳 Jetzt bezahlen", callback_data: `pay_now:${creator_id}` }]] }
-    });
+    // Wird automatisch von startCheckout übernommen
+    const botChatId = Number(chatId);
+    await bot.sendMessage(botChatId, "⏳ Öffne den Bezahl-Dialog…");
+    await startCheckout(creator_id, chatId, userId);
   } else {
-    await bot.sendMessage(Number(chatId), `Noch offen: ${s.age ? "" : "🔞 Alterscheck "}${s.rules ? "" : "📜 Regeln akzeptieren"}`.trim());
+    const missing = [
+      s.age ? null : "🔞 Alterscheck",
+      s.rules ? null : "📜 Regeln akzeptieren"
+    ].filter(Boolean).join(" & ");
+    await bot.sendMessage(Number(chatId), `Noch offen: ${missing}`.trim());
   }
 }
 
@@ -1295,13 +1298,11 @@ async function runExpirySweep() {
 
       try {
         await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
+          method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id) })
         });
         await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
+          method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chat_id: group, user_id: Number(u.telegram_id), only_if_banned: true })
         });
 
