@@ -89,6 +89,7 @@ async function getCreatorCfgById(creator_id) {
     .from("creator_config")
     .select(`
       creator_id,
+      creator_name,
       preis,
       vip_days,
       vip_dauer,
@@ -101,7 +102,8 @@ async function getCreatorCfgById(creator_id) {
       regeln_text,
       voice_enabled,
       voice_file_id,
-      voice_caption
+      voice_caption,
+      profile_image_url
     `)
     .eq("creator_id", creator_id)
     .maybeSingle();
@@ -152,6 +154,7 @@ async function saveCreatorVoiceCaption(telegramId, caption) {
   if (error) console.error("saveCreatorVoiceCaption error:", error.message);
   return !error;
 }
+
 // Preis-Parsing: akzeptiert "12,99", "12.99", "1.234,56", "€ 12,50", etc.
 function parsePrice(preisLike) {
   if (preisLike == null) return { value: 0, cents: 0, display: "0 €" };
@@ -165,7 +168,7 @@ function parsePrice(preisLike) {
   const hasDot   = raw.includes(".");
   if (hasComma && hasDot) {
     const lastComma = raw.lastIndexOf(",");
-       const lastDot   = raw.lastIndexOf(".");
+    const lastDot   = raw.lastIndexOf(".");
     const decimalSep = lastComma > lastDot ? "," : ".";
     // alle Gruppentrenner entfernen (der "andere" Trenner)
     const groupSep = decimalSep === "," ? "." : ",";
@@ -174,9 +177,7 @@ function parsePrice(preisLike) {
   } else if (hasComma) {
     // nur Komma → europäisches Dezimal
     raw = raw.replace(",", ".");
-  } else {
-    // nur Punkt oder nur Ziffern → schon okay
-  }
+  } // sonst: nur Punkt/ Ziffern → ok
 
   const value = Number.parseFloat(raw);
   const safe  = Number.isFinite(value) ? value : 0;
@@ -191,6 +192,7 @@ function parsePrice(preisLike) {
 
   return { value: safe, cents, display };
 }
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Robuste VIP-Persistenz (Retries, Dead-Letter, Admin-Alert)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -313,59 +315,40 @@ async function isActiveVip(creator_id, telegram_id) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Dynamische Einladungen (Join-Request ohne member_limit)
+// Foto-Helfer: Creator-Profilbild ganz normal als Foto senden (URL → Buffer-Fallback)
 // ──────────────────────────────────────────────────────────────────────────────
-async function sendDynamicInvitePerModel({ creator_id, group_chat_id, chat_id_or_user_id }) {
-  if (!group_chat_id) {
-    console.error("sendDynamicInvite: group_chat_id fehlt");
-    return { ok: false, reason: "NO_GROUP" };
-  }
+async function sendCreatorProfilePlain(creator_id, chat_id) {
   try {
-    const expire = Math.floor(Date.now() / 1000) + (15 * 60); // 15 Min gültig
-    const payload = {
-      chat_id: group_chat_id,
-      expire_date: expire,
-      member_limit: 1,          // 👈 sorgt dafür, dass nur 1 Person den Link nutzen kann
-      creates_join_request: false
-    };
+    const cfg = await getCreatorCfgById(creator_id);
+    const url = cfg?.profile_image_url;
+    if (!url) return false;
 
-    const resp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/createChatInviteLink`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }).then(r => r.json());
+    const caption = cfg?.creator_name ? `⭐ ${cfg.creator_name}` : undefined;
 
-    if (!(resp?.ok && resp?.result?.invite_link)) {
-      console.error("createChatInviteLink failed:", resp);
-      return { ok: false, reason: "TG_API", raw: resp };
+    // 1) Direkt per URL versuchen
+    try {
+      await bot.sendPhoto(Number(chat_id), url, caption ? { caption } : undefined);
+      return true;
+    } catch (e) {
+      console.warn("sendPhoto via URL failed, trying buffer:", e?.message || e);
     }
 
-    const invite_link = resp.result.invite_link;
-    const expires_at = new Date(expire * 1000).toISOString();
+    // 2) Fallback: Datei laden & als Buffer hochladen
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      console.error("image fetch failed:", resp.status, url);
+      return false;
+    }
+    const contentType = resp.headers.get("content-type") || "image/jpeg";
+    const ab = await resp.arrayBuffer();
+    const buf = Buffer.from(ab);
+    const fileOptions = { filename: "creator_profile.jpg", contentType };
 
-    // Logging ins invite_links-Table
-    try {
-      await supabase.from("invite_links").insert({
-        creator_id,
-        telegram_id: String(chat_id_or_user_id),
-        chat_id: String(chat_id_or_user_id),
-        group_chat_id: String(group_chat_id),
-        invite_link,
-        expires_at,
-        member_limit: 1,
-        used: false
-      });
-    } catch {/* ignoriere */}
-
-    await bot.sendMessage(
-      Number(chat_id_or_user_id),
-      `🎟️ Dein VIP-Zugang (einmalig, 15 Min gültig): ${invite_link}`
-    );
-
-    return { ok: true, invite_link, expires_at };
+    await bot.sendPhoto(Number(chat_id), buf, caption ? { caption } : undefined, fileOptions);
+    return true;
   } catch (e) {
-    console.error("sendDynamicInvite error:", e.message);
-    return { ok: false, reason: "EXCEPTION" };
+    console.error("sendCreatorProfilePlain error:", e?.message || e);
+    return false;
   }
 }
 
@@ -391,46 +374,6 @@ app.post(telegramPath, (req, res) => {
   try { bot.processUpdate(req.body); } catch (err) { console.error("processUpdate error:", err); }
   res.sendStatus(200);
 });
-// Schickt das Creator-Profilbild als ganz normales Foto in den Chat.
-// Robuste Variante: zuerst URL direkt; wenn das scheitert -> Download + Buffer Upload.
-async function sendCreatorProfilePlain(creator_id, chat_id) {
-  try {
-    const { data, error } = await supabase
-      .from("creator_config")
-      .select("profile_image_url, creator_name")
-      .eq("creator_id", creator_id)
-      .maybeSingle();
-
-    if (error) { console.error("profile fetch error:", error.message); return false; }
-    const url = data?.profile_image_url;
-    if (!url) return false;
-
-    const caption = data?.creator_name ? `⭐ ${data.creator_name}` : undefined;
-
-    // 1) Direkt mit URL versuchen
-    try {
-      await bot.sendPhoto(Number(chat_id), url, caption ? { caption } : undefined);
-      return true;
-    } catch (e) {
-      console.warn("sendPhoto via URL failed, try buffer:", e?.message || e);
-    }
-
-    // 2) Fallback: Datei laden und als Buffer hochladen (sicher gegen URL-Policies/CDN)
-    const resp = await fetch(url);
-    if (!resp.ok) { console.error("image fetch failed:", resp.status, url); return false; }
-    const contentType = resp.headers.get("content-type") || "image/jpeg";
-    const ab = await resp.arrayBuffer();
-    const buf = Buffer.from(ab);
-
-    // node-telegram-bot-api: 4.0+ akzeptiert Buffer mit fileOptions { filename, contentType }
-    const fileOptions = { filename: "creator_profile.jpg", contentType };
-    await bot.sendPhoto(Number(chat_id), buf, caption ? { caption } : undefined, fileOptions);
-    return true;
-  } catch (e) {
-    console.error("sendCreatorProfilePlain error:", e?.message || e);
-    return false;
-  }
-}
 
 async function bootstrapTelegram() {
   try {
@@ -640,7 +583,10 @@ async function bootstrapTelegram() {
     const creator = await getCreatorCfgById(creator_id);
     if (!creator) { await bot.sendMessage(msg.chat.id, "❌ Creator-Konfiguration nicht gefunden."); return; }
 
-    // Voice-Intro (falls vorhanden) direkt vorspielen
+    // 👉 NEU: ZUERST normales Foto senden (falls vorhanden)
+    await sendCreatorProfilePlain(creator_id, msg.chat.id);
+
+    // Danach Voice-Intro (falls vorhanden) direkt vorspielen
     if (creator?.voice_enabled && creator?.voice_file_id && msg.chat.type === "private") {
       try {
         await bot.sendVoice(msg.chat.id, creator.voice_file_id, {
@@ -1112,7 +1058,9 @@ app.post("/stripe/webhook", async (req, res) => {
           `✅ Danke, deine VIP-Zeit wurde verlängert!\nNeues Ablaufdatum: ${vip_bis}`
         );
       } else {
-        // 🆕 Erstkauf: Welcome + Invite (wie zuvor)
+        // 🆕 Erstkauf: Erst Foto, dann Welcome + Invite
+        await sendCreatorProfilePlain(creator_id, targetChat);
+
         if (cfg?.welcome_text) {
           await bot.sendMessage(targetChat, escapeMDV2(cfg.welcome_text), { parse_mode: "MarkdownV2" });
         }
