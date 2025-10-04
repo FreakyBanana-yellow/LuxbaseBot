@@ -391,44 +391,31 @@ app.post(telegramPath, (req, res) => {
   try { bot.processUpdate(req.body); } catch (err) { console.error("processUpdate error:", err); }
   res.sendStatus(200);
 });
-// Holt das Creator-Profilbild und setzt es als Gruppenbild
-async function tryApplyGroupProfile(creator_id, group_chat_id) {
+// Holt das Profilbild aus creator_config und sendet es in den Chat (falls vorhanden)
+async function sendCreatorProfileIfAny(creator_id, chat_id) {
   try {
     const { data, error } = await supabase
       .from("creator_config")
-      .select("profile_image_url")
+      .select("profile_image_url, creator_name")
       .eq("creator_id", creator_id)
       .maybeSingle();
 
-    if (error) { console.error("profile fetch error:", error.message); return false; }
+    if (error) {
+      console.error("sendCreatorProfileIfAny fetch error:", error.message);
+      return false;
+    }
     const url = data?.profile_image_url;
     if (!url) return false;
 
-    const img = await fetch(url);
-    if (!img.ok) { console.error("image fetch failed:", img.status); return false; }
-    const ab = await img.arrayBuffer();
-    const file = new Blob([ab], { type: img.headers.get("content-type") || "image/jpeg" });
-
-    const fd = new FormData();
-    fd.append("chat_id", String(group_chat_id));
-    // Dateiname ist wichtig, sonst akzeptiert Telegram es teils nicht
-    fd.append("photo", file, "group_photo.jpg");
-
-    const resp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setChatPhoto`, {
-      method: "POST",
-      body: fd
-    }).then(r => r.json());
-
-    if (!resp?.ok) {
-      console.error("setChatPhoto failed:", resp);
-      return false;
-    }
+    const caption = data?.creator_name ? `⭐ ${data.creator_name}` : undefined;
+    await bot.sendPhoto(Number(chat_id), url, caption ? { caption } : undefined);
     return true;
   } catch (e) {
-    console.error("tryApplyGroupProfile error:", e?.message || e);
+    console.error("sendCreatorProfileIfAny error:", e?.message || e);
     return false;
   }
 }
+
 async function bootstrapTelegram() {
   try {
     // alten Webhook entfernen, dann neu setzen
